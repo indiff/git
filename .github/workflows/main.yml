@@ -215,8 +215,8 @@ jobs:
       run: |
         mkdir -p artifacts &&
         eval "$(make -n artifacts-tar INCLUDE_DLLS_IN_ARTIFACTS=YesPlease ARTIFACTS_DIRECTORY=artifacts NO_GETTEXT=YesPlease 2>&1 | grep ^tar)"
-    - name: zip up tracked files
-      run: git archive -o artifacts/tracked.tar.gz HEAD
+    # - name: zip up tracked files
+    #   run: git archive -o artifacts/tracked.tar.gz HEAD
     - name: upload tracked files and build artifacts
       uses: actions/upload-artifact@v5
       with:
@@ -513,3 +513,77 @@ jobs:
     - uses: actions/checkout@v5
     - run: ci/install-dependencies.sh
     - run: ci/test-documentation.sh
+  publish_release:
+    name: Publish release
+    #if: ${{ !cancelled() && ( github.event_name == 'schedule' || github.event.inputs.doRelease == 'true' ) }}
+    needs: [vs-build] 
+    runs-on: ubuntu-latest
+    steps:
+      # - name: Free Disk-Space
+      #   run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vs*
+          merge-multiple: false
+          path: artifacts
+      - name: Update Latest
+        run: |
+          set -xe
+          shopt -s nullglob
+          sudo timedatectl set-timezone Asia/Shanghai
+          timedatectl status
+          # 使用 GitHub API 获取最后一次提交信息
+          commit_info=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/git-for-windows/git/commits \
+          | jq -r '.[0] | "\(.commit.author.name) \(.commit.message) \(.commit.author.date)"')
+          # 输出变量
+          echo "Commit Info: $commit_info"
+          gh release create "$TAGNAME" --target "main" --title "$NAME" ${cdir}/artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Prune old releases
+        run: |
+          set -xe
+          git fetch --tags
+          TAGS=( $(git tag -l "*2025*" | sort -r) )
+
+          KEEP_LATEST=14
+          KEEP_MONTHLY=24
+
+          LATEST_TAGS=()
+          MONTHLY_TAGS=()
+
+          CUR_MONTH="-1"
+
+          # echo "tags: $TAGS"
+          for TAG in ${TAGS[@]}; do
+              if [[ ${#LATEST_TAGS[@]} -lt ${KEEP_LATEST} ]]; then
+                  # echo "tag: $TAG"
+                  LATEST_TAGS+=( "$TAG" )
+              fi
+
+              if [[ ${#MONTHLY_TAGS[@]} -lt ${KEEP_MONTHLY} ]]; then
+                  TAG_MONTH="$(echo $TAG | cut -d- -f2)"
+              echo "TAG_MONTH: ${TAG_MONTH} ${CUR_MONTH}"
+                  if [[ ${TAG_MONTH} != ${CUR_MONTH} ]]; then
+                      CUR_MONTH="${TAG_MONTH}"
+                      MONTHLY_TAGS+=( "$TAG" )
+                  fi
+              fi
+          done
+
+          for TAG in ${LATEST_TAGS[@]} ${MONTHLY_TAGS[@]}; do
+              TAGS=( "${TAGS[@]/$TAG}" )
+          done
+
+          for TAG in ${TAGS[@]}; do
+              echo "Deleting ${TAG}"
+              gh release delete --cleanup-tag --yes "${TAG}"
+          done
+          git push --tags --prune
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
