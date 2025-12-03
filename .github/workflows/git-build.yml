@@ -1,4 +1,4 @@
-name: CI
+name: window git build
 
 on: 
   pull_request:
