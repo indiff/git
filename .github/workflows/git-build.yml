@@ -1,0 +1,157 @@
+name: CI
+
+on: 
+  pull_request:
+      branches: [ main,dev ]
+  push:
+      branches: [ main,dev ]
+  schedule:
+    - cron: '0 0 * * *'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+env:
+  DEVELOPER: 1
+
+# If more than one workflow run is triggered for the very same commit hash
+# (which happens when multiple branches pointing to the same commit), only
+# the first one is allowed to run, the second will be kept in the "queued"
+# state. This allows a successful completion of the first run to be reused
+# in the second run via the `skip-if-redundant` logic in the `config` job.
+#
+# The only caveat is that if a workflow run is triggered for the same commit
+# hash that another run is already being held, that latter run will be
+# canceled. For more details about the `concurrency` attribute, see:
+# https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
+concurrency:
+  group: ${{ github.sha }}
+
+jobs:
+  vs-build:
+    name: win+VS build
+    needs: ci-config
+    # if: github.event.repository.owner.login == 'git-for-windows' && needs.ci-config.outputs.enabled == 'yes'
+    env:
+      NO_PERL: 1
+      GIT_CONFIG_PARAMETERS: "'user.name=CI' 'user.email=ci@git'"
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    concurrency:
+      group: vs-build-${{ github.ref }}-${{ matrix.arch }}
+      cancel-in-progress: ${{ needs.ci-config.outputs.skip_concurrent == 'yes' }}
+    steps:
+    - uses: actions/checkout@v5
+    - uses: git-for-windows/setup-git-for-windows-sdk@v1
+    - name: initialize vcpkg
+      uses: actions/checkout@v5
+      with:
+        repository: 'microsoft/vcpkg'
+        path: 'compat/vcbuild/vcpkg'
+    - name: download vcpkg artifacts
+      uses: git-for-windows/get-azure-pipelines-artifact@v0
+      with:
+        repository: git/git
+        definitionId: 9
+    - name: add msbuild to PATH
+      uses: microsoft/setup-msbuild@v2
+    - name: copy dlls to root
+      shell: cmd
+      run: compat\vcbuild\vcpkg_copy_dlls.bat release ${{ matrix.arch }}-windows
+    - name: generate Visual Studio solution
+      shell: bash
+      run: |
+        cmake `pwd`/contrib/buildsystems/ -DCMAKE_PREFIX_PATH=`pwd`/compat/vcbuild/vcpkg/installed/${{ matrix.arch }}-windows \
+        -DNO_GETTEXT=YesPlease -DPERL_TESTS=OFF -DPYTHON_TESTS=OFF -DCURL_NO_CURL_CMAKE=ON -DCMAKE_GENERATOR_PLATFORM=${{ matrix.arch }} -DVCPKG_ARCH=${{ matrix.arch }}-windows -DHOST_CPU=${{ matrix.arch }}
+    - name: MSBuild
+      run: msbuild git.sln -property:Configuration=Release -property:Platform=${{ matrix.arch }} -maxCpuCount:4 -property:PlatformToolset=v142
+    - name: bundle artifact tar
+      shell: bash
+      env:
+        MSVC: 1
+        VCPKG_ROOT: ${{github.workspace}}\compat\vcbuild\vcpkg
+      run: |
+        mkdir -p artifacts &&
+        eval "$(make -n artifacts-tar INCLUDE_DLLS_IN_ARTIFACTS=YesPlease ARTIFACTS_DIRECTORY=artifacts NO_GETTEXT=YesPlease 2>&1 | grep ^tar)"
+    # - name: zip up tracked files
+    #   run: git archive -o artifacts/tracked.tar.gz HEAD
+    - name: upload tracked files and build artifacts
+      uses: actions/upload-artifact@v5
+      with:
+        name: vs-artifacts-${{ matrix.arch }}
+        path: artifacts
+ 
+  publish_release:
+    name: Publish release
+    #if: ${{ !cancelled() && ( github.event_name == 'schedule' || github.event.inputs.doRelease == 'true' ) }}
+    needs: [vs-build] 
+    runs-on: ubuntu-latest
+    steps:
+      # - name: Free Disk-Space
+      #   run: df -h && sudo apt-get clean && docker system prune -a -f && sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc && df -h
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vs*
+          merge-multiple: false
+          path: artifacts
+      - name: Update Latest
+        run: |
+          set -xe
+          shopt -s nullglob
+          sudo timedatectl set-timezone Asia/Shanghai
+          timedatectl status
+          # 使用 GitHub API 获取最后一次提交信息
+          commit_info=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/git-for-windows/git/commits \
+          | jq -r '.[0] | "\(.commit.author.name) \(.commit.message) \(.commit.author.date)"')
+          # 输出变量
+          echo "Commit Info: $commit_info"
+          gh release create "$TAGNAME" --target "main" --title "$NAME" ${cdir}/artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Prune old releases
+        run: |
+          set -xe
+          git fetch --tags
+          TAGS=( $(git tag -l "*2025*" | sort -r) )
+
+          KEEP_LATEST=14
+          KEEP_MONTHLY=24
+
+          LATEST_TAGS=()
+          MONTHLY_TAGS=()
+
+          CUR_MONTH="-1"
+
+          # echo "tags: $TAGS"
+          for TAG in ${TAGS[@]}; do
+              if [[ ${#LATEST_TAGS[@]} -lt ${KEEP_LATEST} ]]; then
+                  # echo "tag: $TAG"
+                  LATEST_TAGS+=( "$TAG" )
+              fi
+
+              if [[ ${#MONTHLY_TAGS[@]} -lt ${KEEP_MONTHLY} ]]; then
+                  TAG_MONTH="$(echo $TAG | cut -d- -f2)"
+              echo "TAG_MONTH: ${TAG_MONTH} ${CUR_MONTH}"
+                  if [[ ${TAG_MONTH} != ${CUR_MONTH} ]]; then
+                      CUR_MONTH="${TAG_MONTH}"
+                      MONTHLY_TAGS+=( "$TAG" )
+                  fi
+              fi
+          done
+
+          for TAG in ${LATEST_TAGS[@]} ${MONTHLY_TAGS[@]}; do
+              TAGS=( "${TAGS[@]/$TAG}" )
+          done
+
+          for TAG in ${TAGS[@]}; do
+              echo "Deleting ${TAG}"
+              gh release delete --cleanup-tag --yes "${TAG}"
+          done
+          git push --tags --prune
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
