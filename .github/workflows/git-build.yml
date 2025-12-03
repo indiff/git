@@ -122,7 +122,12 @@ jobs:
           for dir in */; do
               dir_name="${dir%/}"  # 移除尾部的斜杠
               cd "${cdir}/artifacts/$dir_name"
-              zip -r -9 "${cdir}/artifacts/$TAGNAME_${dir_name}.zip" .
+              if [[ -f "artifacts.tar.gz" ]]; then
+                mkdir -p shit
+                tar -xzf "artifacts.tar.gz" -C shit
+                cd shit
+                zip -r -9 "${cdir}/artifacts/$TAGNAME_${dir_name}.zip" .
+              fi
           done
           gh release create "$TAGNAME" --target "main" --notes "${NOTES}" --title "$NAME" ${cdir}/artifacts/*.zip
         env:
