@@ -1,4 +1,4 @@
-name: window git build
+name: git-build(windows)
 
 on: 
   pull_request:
