@@ -103,6 +103,7 @@ jobs:
           shopt -s nullglob
           sudo timedatectl set-timezone Asia/Shanghai
           timedatectl status
+          sudo apt-get install -y zip unzip
           # 使用 GitHub API 获取最后一次提交信息
           commit_info=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
           -H "Accept: application/vnd.github.v3+json" \
@@ -116,7 +117,14 @@ jobs:
           gh release delete --cleanup-tag --yes "$TAGNAME" || true
           echo "Commit Info: $commit_info"
           NOTES="$(printf " > $commit_info\n ")"
-          gh release create "$TAGNAME" --target "main" --notes "${NOTES}" --title "$NAME" ${cdir}/artifacts/*
+          cd "${cdir}/artifacts/"
+          # 为当前目录下的每个文件夹创建单独的 zip 文件
+          for dir in */; do
+              dir_name="${dir%/}"  # 移除尾部的斜杠
+              cd "${cdir}/artifacts/$dir_name"
+              zip -r -9 "${cdir}/artifacts/$TAGNAME_${dir_name}.zip" .
+          done
+          gh release create "$TAGNAME" --target "main" --notes "${NOTES}" --title "$NAME" ${cdir}/artifacts/*.zip
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Prune old releases
