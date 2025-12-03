@@ -64,7 +64,7 @@ jobs:
         cmake `pwd`/contrib/buildsystems/ -DCMAKE_PREFIX_PATH=`pwd`/compat/vcbuild/vcpkg/installed/${{ matrix.arch }}-windows \
         -DNO_GETTEXT=YesPlease -DPERL_TESTS=OFF -DPYTHON_TESTS=OFF -DCURL_NO_CURL_CMAKE=ON -DCMAKE_GENERATOR_PLATFORM=${{ matrix.arch }} -DVCPKG_ARCH=${{ matrix.arch }}-windows -DHOST_CPU=${{ matrix.arch }}
     - name: MSBuild
-      run: msbuild git.sln -property:Configuration=Release -property:Platform=${{ matrix.arch }} -maxCpuCount:4 -property:PlatformToolset=v142
+      run: msbuild git.sln -property:Configuration=Release -property:Platform=${{ matrix.arch }} -maxCpuCount:4 -property:PlatformToolset=v143
     - name: bundle artifact tar
       shell: bash
       env:
@@ -108,9 +108,15 @@ jobs:
           -H "Accept: application/vnd.github.v3+json" \
           https://api.github.com/repos/git-for-windows/git/commits \
           | jq -r '.[0] | "\(.commit.author.name) \(.commit.message) \(.commit.author.date)"')
+          cdir="$(pwd)"
           # 输出变量
+          export GIT_DEF_VER=$(curl -s https://raw.githubusercontent.com/git/git/refs/heads/master/GIT-VERSION-GEN | grep "^DEF_VER=" | head -n1 | cut -d= -f2 | tr -d '"')
+          export build_timestamp="$(date +'%Y%m%d_%H%M')"
+          TAGNAME="${GIT_DEF_VER}_${build_timestamp}"
+          gh release delete --cleanup-tag --yes "$TAGNAME" || true
           echo "Commit Info: $commit_info"
-          gh release create "$TAGNAME" --target "main" --title "$NAME" ${cdir}/artifacts/*
+          NOTES="$(printf " > $commit_info\n ")"
+          gh release create "$TAGNAME" --target "main" --notes "${NOTES}" --title "$NAME" ${cdir}/artifacts/*
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Prune old releases
