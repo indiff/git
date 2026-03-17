@@ -33,7 +33,8 @@ jobs:
     env:
       NO_PERL: 1
       GIT_CONFIG_PARAMETERS: "'user.name=CI' 'user.email=ci@git'"
-    runs-on: windows-latest
+    #runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     strategy:
       matrix:
         arch: [x64, arm64]
