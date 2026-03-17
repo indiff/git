@@ -114,7 +114,9 @@ jobs:
     name: win build
     needs: ci-config
     if: needs.ci-config.outputs.enabled == 'yes'
-    runs-on: windows-latest
+    #runs-on: windows-latest
+    runs-on: windows-2025-vs2026
+
     concurrency:
       group: windows-build-${{ github.ref }}
       cancel-in-progress: ${{ needs.ci-config.outputs.skip_concurrent == 'yes' }}
