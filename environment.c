@@ -80,36 +80,6 @@ int core_sparse_checkout_cone;
 int sparse_expect_files_outside_of_patterns;
 int precomposed_unicode = -1; /* see probe_utf8_pathname_composition() */
 unsigned long pack_size_limit_cfg;
-int max_allowed_tree_depth =
-#ifdef _MSC_VER
-	/*
-	 * When traversing into too-deep trees, Visual C-compiled Git seems to
-	 * run into some internal stack overflow detection in the
-	 * `RtlpAllocateHeap()` function that is called from within
-	 * `git_inflate_init()`'s call tree. The following value seems to be
-	 * low enough to avoid that by letting Git exit with an error before
-	 * the stack overflow can occur.
-	 */
-	512;
-#elif defined(GIT_WINDOWS_NATIVE) && defined(__clang__)
-	/*
-	 * Similar to Visual C, it seems that clang-based builds on Windows
-	 * have a smaller stack space available. When running out of that
-	 * stack space, a `STATUS_STACK_OVERFLOW` is produced. When the
-	 * Git command was run from an MSYS2 Bash, this unfortunately results
-	 * in an exit code 127. Let's prevent that by lowering the maximal
-	 * tree depth; Unfortunately, it seems that the exact limit differs
-	 * for aarch64 vs x86_64, and the difference is too large to simply
-	 * use a single limit.
-	 */
-#if defined(__aarch64__)
-	1280;
-#else
-	1152;
-#endif
-#else
-	2048;
-#endif
 
 #ifndef PROTECT_HFS_DEFAULT
 #define PROTECT_HFS_DEFAULT 0
@@ -572,11 +542,6 @@ int git_default_core_config(const char *var, const char *value,
 
 	if (!strcmp(var, "core.protectntfs")) {
 		protect_ntfs = git_config_bool(var, value);
-		return 0;
-	}
-
-	if (!strcmp(var, "core.maxtreedepth")) {
-		max_allowed_tree_depth = git_config_int(var, value, ctx->kvi);
 		return 0;
 	}
 

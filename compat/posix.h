@@ -341,8 +341,7 @@ int gitsetenv(const char *, const char *, int);
 #endif
 
 #ifdef NO_MKDTEMP
-#define mkdtemp gitmkdtemp
-char *gitmkdtemp(char *);
+#define mkdtemp git_mkdtemp
 #endif
 
 #ifdef NO_UNSETENV

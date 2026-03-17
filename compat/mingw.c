@@ -858,6 +858,7 @@ int mingw_open (const char *filename, int oflags, ...)
 	int fd, create = (oflags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL);
 	wchar_t wfilename[MAX_LONG_PATH];
 	open_fn_t open_fn;
+	WIN32_FILE_ATTRIBUTE_DATA fdata;
 
 	DECLARE_PROC_ADDR(ntdll.dll, NTSTATUS, NTAPI, RtlGetLastNtStatus, void);
 
@@ -890,6 +891,19 @@ int mingw_open (const char *filename, int oflags, ...)
 		wcscpy(wfilename, L"nul");
 	else if (xutftowcs_long_path(wfilename, filename) < 0)
 		return -1;
+
+	/*
+	 * When `symlink` exists and is a symbolic link pointing to a
+	 * non-existing file, `_wopen(symlink, O_CREAT | O_EXCL)` would
+	 * create that file. Not what we want: Linux would say `EEXIST`
+	 * in that instance, which is therefore what Git expects.
+	 */
+	if (create &&
+	    GetFileAttributesExW(wfilename, GetFileExInfoStandard, &fdata) &&
+	    (fdata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+		errno = EEXIST;
+		return -1;
+	}
 
 	fd = open_fn(wfilename, oflags, mode);
 
@@ -1170,8 +1184,96 @@ static int has_valid_directory_prefix(wchar_t *wfilename)
 	return 1;
 }
 
-static int readlink_1(const WCHAR *wpath, BOOL fail_on_unknown_tag,
-		      char *tmpbuf, int *plen, DWORD *ptag);
+#ifndef _WINNT_H
+/*
+ * The REPARSE_DATA_BUFFER structure is defined in the Windows DDK (in
+ * ntifs.h) and in MSYS1's winnt.h (which defines _WINNT_H). So define
+ * it ourselves if we are on MSYS2 (whose winnt.h defines _WINNT_).
+ */
+typedef struct _REPARSE_DATA_BUFFER {
+	DWORD  ReparseTag;
+	WORD   ReparseDataLength;
+	WORD   Reserved;
+#ifndef _MSC_VER
+	_ANONYMOUS_UNION
+#endif
+	union {
+		struct {
+			WORD   SubstituteNameOffset;
+			WORD   SubstituteNameLength;
+			WORD   PrintNameOffset;
+			WORD   PrintNameLength;
+			ULONG  Flags;
+			WCHAR PathBuffer[1];
+		} SymbolicLinkReparseBuffer;
+		struct {
+			WORD   SubstituteNameOffset;
+			WORD   SubstituteNameLength;
+			WORD   PrintNameOffset;
+			WORD   PrintNameLength;
+			WCHAR PathBuffer[1];
+		} MountPointReparseBuffer;
+		struct {
+			BYTE   DataBuffer[1];
+		} GenericReparseBuffer;
+	} DUMMYUNIONNAME;
+} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
+#endif
+
+static int read_reparse_point(const WCHAR *wpath, BOOL fail_on_unknown_tag,
+			      char *tmpbuf, int *plen, DWORD *ptag)
+{
+	HANDLE handle;
+	WCHAR *wbuf;
+	REPARSE_DATA_BUFFER *b = alloca(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
+	DWORD dummy;
+
+	/* read reparse point data */
+	handle = CreateFileW(wpath, 0,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+			OPEN_EXISTING,
+			FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+	if (handle == INVALID_HANDLE_VALUE) {
+		errno = err_win_to_posix(GetLastError());
+		return -1;
+	}
+	if (!DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0, b,
+			MAXIMUM_REPARSE_DATA_BUFFER_SIZE, &dummy, NULL)) {
+		errno = err_win_to_posix(GetLastError());
+		CloseHandle(handle);
+		return -1;
+	}
+	CloseHandle(handle);
+
+	/* get target path for symlinks or mount points (aka 'junctions') */
+	switch ((*ptag = b->ReparseTag)) {
+	case IO_REPARSE_TAG_SYMLINK:
+		wbuf = (WCHAR*) (((char*) b->SymbolicLinkReparseBuffer.PathBuffer)
+				+ b->SymbolicLinkReparseBuffer.SubstituteNameOffset);
+		*(WCHAR*) (((char*) wbuf)
+				+ b->SymbolicLinkReparseBuffer.SubstituteNameLength) = 0;
+		break;
+	case IO_REPARSE_TAG_MOUNT_POINT:
+		wbuf = (WCHAR*) (((char*) b->MountPointReparseBuffer.PathBuffer)
+				+ b->MountPointReparseBuffer.SubstituteNameOffset);
+		*(WCHAR*) (((char*) wbuf)
+				+ b->MountPointReparseBuffer.SubstituteNameLength) = 0;
+		break;
+	default:
+		if (fail_on_unknown_tag) {
+			errno = EINVAL;
+			return -1;
+		} else {
+			*plen = MAX_PATH;
+			return 0;
+		}
+	}
+
+	if ((*plen =
+	     xwcstoutf(tmpbuf, normalize_ntpath(wbuf), MAX_PATH)) <  0)
+		return -1;
+	return 0;
+}
 
 int mingw_lstat(const char *file_name, struct stat *buf)
 {
@@ -1196,8 +1298,8 @@ int mingw_lstat(const char *file_name, struct stat *buf)
 		if (fdata.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
 			char tmpbuf[MAX_LONG_PATH];
 
-			if (readlink_1(wfilename, FALSE, tmpbuf, &link_len,
-				       &reparse_tag) < 0)
+			if (read_reparse_point(wfilename, FALSE, tmpbuf,
+					       &link_len, &reparse_tag) < 0)
 				return -1;
 		}
 		buf->st_ino = 0;
@@ -1427,30 +1529,6 @@ unsigned int sleep (unsigned int seconds)
 {
 	Sleep(seconds*1000);
 	return 0;
-}
-
-char *mingw_mktemp(char *template)
-{
-	wchar_t wtemplate[MAX_PATH];
-	int offset = 0;
-
-	/* we need to return the path, thus no long paths here! */
-	if (xutftowcsn(wtemplate, template, MAX_PATH, -1) < 0) {
-		if (errno == ERANGE)
-			errno = ENAMETOOLONG;
-		return NULL;
-	}
-
-	if (is_dir_sep(template[0]) && !is_dir_sep(template[1]) &&
-	    iswalpha(wtemplate[0]) && wtemplate[1] == L':') {
-		/* We have an absolute path missing the drive prefix */
-		offset = 2;
-	}
-	if (!_wmktemp(wtemplate))
-		return NULL;
-	if (xwcstoutf(template, wtemplate + offset, strlen(template) + 1) < 0)
-		return NULL;
-	return template;
 }
 
 int mkstemp(char *template)
@@ -3348,97 +3426,6 @@ int mingw_create_symlink(struct index_state *index, const char *target, const ch
 	return -1;
 }
 
-#ifndef _WINNT_H
-/*
- * The REPARSE_DATA_BUFFER structure is defined in the Windows DDK (in
- * ntifs.h) and in MSYS1's winnt.h (which defines _WINNT_H). So define
- * it ourselves if we are on MSYS2 (whose winnt.h defines _WINNT_).
- */
-typedef struct _REPARSE_DATA_BUFFER {
-	DWORD  ReparseTag;
-	WORD   ReparseDataLength;
-	WORD   Reserved;
-#ifndef _MSC_VER
-	_ANONYMOUS_UNION
-#endif
-	union {
-		struct {
-			WORD   SubstituteNameOffset;
-			WORD   SubstituteNameLength;
-			WORD   PrintNameOffset;
-			WORD   PrintNameLength;
-			ULONG  Flags;
-			WCHAR PathBuffer[1];
-		} SymbolicLinkReparseBuffer;
-		struct {
-			WORD   SubstituteNameOffset;
-			WORD   SubstituteNameLength;
-			WORD   PrintNameOffset;
-			WORD   PrintNameLength;
-			WCHAR PathBuffer[1];
-		} MountPointReparseBuffer;
-		struct {
-			BYTE   DataBuffer[1];
-		} GenericReparseBuffer;
-	} DUMMYUNIONNAME;
-} REPARSE_DATA_BUFFER, *PREPARSE_DATA_BUFFER;
-#endif
-
-static int readlink_1(const WCHAR *wpath, BOOL fail_on_unknown_tag,
-		      char *tmpbuf, int *plen, DWORD *ptag)
-{
-	HANDLE handle;
-	WCHAR *wbuf;
-	REPARSE_DATA_BUFFER *b = alloca(MAXIMUM_REPARSE_DATA_BUFFER_SIZE);
-	DWORD dummy;
-
-	/* read reparse point data */
-	handle = CreateFileW(wpath, 0,
-			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-			OPEN_EXISTING,
-			FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-	if (handle == INVALID_HANDLE_VALUE) {
-		errno = err_win_to_posix(GetLastError());
-		return -1;
-	}
-	if (!DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, NULL, 0, b,
-			MAXIMUM_REPARSE_DATA_BUFFER_SIZE, &dummy, NULL)) {
-		errno = err_win_to_posix(GetLastError());
-		CloseHandle(handle);
-		return -1;
-	}
-	CloseHandle(handle);
-
-	/* get target path for symlinks or mount points (aka 'junctions') */
-	switch ((*ptag = b->ReparseTag)) {
-	case IO_REPARSE_TAG_SYMLINK:
-		wbuf = (WCHAR*) (((char*) b->SymbolicLinkReparseBuffer.PathBuffer)
-				+ b->SymbolicLinkReparseBuffer.SubstituteNameOffset);
-		*(WCHAR*) (((char*) wbuf)
-				+ b->SymbolicLinkReparseBuffer.SubstituteNameLength) = 0;
-		break;
-	case IO_REPARSE_TAG_MOUNT_POINT:
-		wbuf = (WCHAR*) (((char*) b->MountPointReparseBuffer.PathBuffer)
-				+ b->MountPointReparseBuffer.SubstituteNameOffset);
-		*(WCHAR*) (((char*) wbuf)
-				+ b->MountPointReparseBuffer.SubstituteNameLength) = 0;
-		break;
-	default:
-		if (fail_on_unknown_tag) {
-			errno = EINVAL;
-			return -1;
-		} else {
-			*plen = MAX_LONG_PATH;
-			return 0;
-		}
-	}
-
-	if ((*plen =
-	     xwcstoutf(tmpbuf, normalize_ntpath(wbuf), MAX_LONG_PATH)) <  0)
-		return -1;
-	return 0;
-}
-
 int readlink(const char *path, char *buf, size_t bufsiz)
 {
 	WCHAR wpath[MAX_LONG_PATH];
@@ -3449,7 +3436,7 @@ int readlink(const char *path, char *buf, size_t bufsiz)
 	if (xutftowcs_long_path(wpath, path) < 0)
 		return -1;
 
-	if (readlink_1(wpath, TRUE, tmpbuf, &len, &tag) < 0)
+	if (read_reparse_point(wpath, TRUE, tmpbuf, &len, &tag) < 0)
 		return -1;
 
 	/*

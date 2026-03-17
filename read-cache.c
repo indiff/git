@@ -479,7 +479,7 @@ int ie_modified(struct index_state *istate,
 	     * So let's just special-case symlinks with a target path length
 	     * (i.e. `sd_size`) of 4096 and force them to be re-checked.
 	     */
-	    (!S_ISLNK(st->st_mode) || ce->ce_stat_data.sd_size != MAX_LONG_PATH) &&
+	    (!S_ISLNK(st->st_mode) || ce->ce_stat_data.sd_size != MAX_PATH) &&
 #endif
 	    (S_ISGITLINK(ce->ce_mode) || ce->ce_stat_data.sd_size != 0))
 		return changed;
@@ -717,7 +717,6 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 	int add_option = (ADD_CACHE_OK_TO_ADD|ADD_CACHE_OK_TO_REPLACE|
 			  (intent_only ? ADD_CACHE_NEW_ONLY : 0));
 	unsigned hash_flags = pretend ? 0 : INDEX_WRITE_OBJECT;
-	struct object_id oid;
 
 	if (flags & ADD_CACHE_RENORMALIZE)
 		hash_flags |= INDEX_RENORMALIZE;
@@ -727,8 +726,6 @@ int add_to_index(struct index_state *istate, const char *path, struct stat *st, 
 
 	namelen = strlen(path);
 	if (S_ISDIR(st_mode)) {
-		if (repo_resolve_gitlink_ref(the_repository, path, "HEAD", &oid) < 0)
-			return error(_("'%s' does not have a commit checked out"), path);
 		while (namelen && path[namelen-1] == '/')
 			namelen--;
 	}
@@ -3823,7 +3820,7 @@ void overlay_tree_on_index(struct index_state *istate,
 
 	if (repo_get_oid(the_repository, tree_name, &oid))
 		die("tree-ish %s not found.", tree_name);
-	tree = parse_tree_indirect(&oid);
+	tree = repo_parse_tree_indirect(the_repository, &oid);
 	if (!tree)
 		die("bad tree-ish %s", tree_name);
 
