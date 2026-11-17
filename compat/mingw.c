@@ -5,9 +5,11 @@
 #include "abspath.h"
 #include "alloc.h"
 #include "attr.h"
+#include "cbtree.h"
 #include "config.h"
 #include "dir.h"
 #include "environment.h"
+#include "repository.h"
 #include "gettext.h"
 #include "repository.h"
 #include "run-command.h"
@@ -385,6 +387,29 @@ process_phantom_symlink(const wchar_t *wtarget, const wchar_t *wlink)
 	wchar_t relative[MAX_LONG_PATH];
 	const wchar_t *rel;
 
+	/*
+	 * Do not follow symlinks to network shares, to avoid NTLM credential
+	 * leak from crafted repositories (e.g. \\attacker-server\share).
+	 * Since paths come in all kind of enterprising shapes and forms (in
+	 * addition to the canonical `\\host\share` form, there's also
+	 * `\??\UNC\host\share`, `\GLOBAL??\UNC\host\share` and also
+	 * `\Device\Mup\host\share`, just to name a few), we simply avoid
+	 * following every symlink target that starts with a slash.
+	 *
+	 * This also catches drive-less absolute paths, of course. These are
+	 * uncommon in practice (and also fragile because they are relative to
+	 * the current working directory's drive). The only "harm" this does
+	 * is that it now requires users to specify via the Git attributes if
+	 * they have such an uncommon symbolic link and need it to be a
+	 * directory type link.
+	 */
+	if (is_wdir_sep(wtarget[0])) {
+		warning("created file symlink '%ls' pointing to '%ls';\n"
+			"set the `symlink` gitattribute to `dir` if a "
+			"directory symlink is required", wlink, wtarget);
+		return PHANTOM_SYMLINK_DONE;
+	}
+
 	/* check that wlink is still a file symlink */
 	if ((GetFileAttributesW(wlink)
 			& (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))
@@ -432,34 +457,248 @@ struct phantom_symlink_info {
 	wchar_t *wtarget;
 };
 
-static struct phantom_symlink_info *phantom_symlinks = NULL;
-static CRITICAL_SECTION phantom_symlinks_cs;
+struct phantom_symlink_list {
+	struct cb_node node;
+	struct phantom_symlink_info *list;
+	struct strbuf directory;
+	uint64_t directory_generation;
+	char key[FLEX_ARRAY];
+};
 
-static void process_phantom_symlinks(void)
+/* Keys live for this process and end in '/' to match whole components. */
+static struct cb_tree phantom_symlinks = {
+	.key_offset = offsetof(struct phantom_symlink_list, key)
+};
+static CRITICAL_SECTION phantom_symlinks_cs;
+static uint64_t phantom_directory_generation;
+static volatile LONG phantom_directories_invalid;
+
+static wchar_t *normalize_ntpath(wchar_t *wbuf);
+
+static void invalidate_phantom_directories(void)
 {
-	struct phantom_symlink_info *current, **psi;
+	InterlockedExchange(&phantom_directories_invalid, 1);
+}
+
+static struct phantom_symlink_list *phantom_symlink_list(const struct strbuf *key)
+{
+	struct phantom_symlink_list *list;
+	struct cb_node *existing;
+
+	FLEX_ALLOC_MEM(list, key, key->buf, key->len);
+	strbuf_init(&list->directory, 0);
+	existing = cb_insert(&phantom_symlinks, &list->node, key->len + 1);
+	if (existing) {
+		free(list);
+		list = container_of(existing,
+				    struct phantom_symlink_list, node);
+	}
+	return list;
+}
+
+static int full_path(struct strbuf *path, const wchar_t *name)
+{
+	wchar_t full[MAX_LONG_PATH];
+	int len = GetFullPathNameW(name, ARRAY_SIZE(full), full, NULL);
+
+	if (!len || len >= ARRAY_SIZE(full)) {
+		errno = len ? ENAMETOOLONG : err_win_to_posix(GetLastError());
+		return -1;
+	}
+	strbuf_reset(path);
+	strbuf_grow(path, 3 * len);
+	len = xwcstoutf(path->buf, normalize_ntpath(full), path->alloc);
+	if (len < 0)
+		die_errno("could not encode path '%ls'", name);
+	strbuf_setlen(path, len);
+	return 0;
+}
+
+static int append_cached_directory(struct cb_node *node, void *data)
+{
+	struct phantom_symlink_list *list =
+		container_of(node, struct phantom_symlink_list, node);
+
+	if (list->directory_generation != phantom_directory_generation)
+		return 0;
+	strbuf_addbuf(data, &list->directory);
+	return 1;
+}
+
+/* Cache keys preserve spelling; they cannot collide with absolute paths. */
+static int append_from_cached_parent(struct strbuf *resolved,
+				     const struct strbuf *path)
+{
+	struct strbuf key = STRBUF_INIT;
+	size_t parent_len;
+	int found;
+
+	/* Advance generations here, not during an in-flight cache fill. */
+	if (InterlockedExchange(&phantom_directories_invalid, 0))
+		phantom_directory_generation++;
+
+	strbuf_addbuf(&key, path);
+	strbuf_strip_file_from_path(&key);
+	parent_len = key.len;
+	strbuf_insertstr(&key, 0, "dir:");
+	found = cb_each(&phantom_symlinks, (const uint8_t *)key.buf,
+			key.len + 1, append_cached_directory, resolved);
+	if (found)
+		strbuf_add(resolved, path->buf + parent_len,
+			    path->len - parent_len);
+	strbuf_release(&key);
+	return found;
+}
+
+static void path_to_key(struct strbuf *path, int resolve)
+{
+	struct strbuf resolved = STRBUF_INIT;
+
+	strbuf_normalize_path(path);
+	if (resolve) {
+		if (!strbuf_realpath_forgiving(&resolved, path->buf, 0)) {
+			strbuf_add_absolute_path(&resolved, path->buf);
+			strbuf_normalize_path(&resolved);
+		}
+		strbuf_swap(path, &resolved);
+	}
+	strbuf_tolower(path);
+	strbuf_complete(path, '/');
+	strbuf_release(&resolved);
+}
+
+static void cache_directory(const struct strbuf *name,
+			     const struct strbuf *resolved)
+{
+	struct strbuf key = STRBUF_INIT;
+	struct phantom_symlink_list *list;
+
+	strbuf_addstr(&key, "dir:");
+	strbuf_addbuf(&key, name);
+	strbuf_complete(&key, '/');
+	list = phantom_symlink_list(&key);
+	strbuf_reset(&list->directory);
+	strbuf_addbuf(&list->directory, resolved);
+	strbuf_complete(&list->directory, '/');
+	list->directory_generation = phantom_directory_generation;
+	strbuf_release(&key);
+}
+
+static int remember_phantom_symlink(struct phantom_symlink_info *psi,
+				    const wchar_t *wlink)
+{
+	struct strbuf path = STRBUF_INIT, full = STRBUF_INIT;
+	struct phantom_symlink_list *list;
+	struct stat st;
+	wchar_t relative[MAX_LONG_PATH];
+	char target[MAX_LONG_PATH * 3];
+	const wchar_t *wtarget = make_relative_to(psi->wtarget, wlink,
+						relative, ARRAY_SIZE(relative));
+	int ret = -1;
+
+	if (!wtarget)
+		return -1;
+	if (!full_path(&full, wtarget) && full.len &&
+	    !is_dir_sep(full.buf[full.len - 1]) &&
+	    append_from_cached_parent(&path, &full) &&
+	    lstat(full.buf, &st) < 0 && errno == ENOENT) {
+		path_to_key(&path, 0);
+	} else {
+		if (wtarget != relative)
+			wcscpy(relative, wtarget);
+		if (xwcstoutf(target, normalize_ntpath(relative),
+			      sizeof(target)) < 0) {
+			error_errno("could not encode symlink target '%ls'",
+				    wtarget);
+			goto out;
+		}
+		strbuf_reset(&path);
+		strbuf_addstr(&path, target);
+		path_to_key(&path, 1);
+	}
+
+	list = phantom_symlink_list(&path);
+	psi->next = list->list;
+	list->list = psi;
+	ret = 0;
+out:
+	strbuf_release(&full);
+	strbuf_release(&path);
+	return ret;
+}
+
+static int collect_phantom_symlinks(struct cb_node *node, void *data)
+{
+	struct phantom_symlink_list *list =
+		container_of(node, struct phantom_symlink_list, node);
+	struct phantom_symlink_info **pending = data;
+
+	while (list->list) {
+		struct phantom_symlink_info *psi = list->list;
+
+		list->list = psi->next;
+		psi->next = *pending;
+		*pending = psi;
+	}
+	return 0;
+}
+
+/* Only symlink changes can make paths below the notified path available. */
+static void process_phantom_symlinks(const wchar_t *name, int recursive)
+{
+	struct strbuf path = STRBUF_INIT, resolved = STRBUF_INIT;
+	struct phantom_symlink_info *pending = NULL;
+
 	EnterCriticalSection(&phantom_symlinks_cs);
-	/* process phantom symlinks list */
-	psi = &phantom_symlinks;
-	while ((current = *psi)) {
-		enum phantom_symlink_result result = process_phantom_symlink(
-				current->wtarget, current->wlink);
-		if (result == PHANTOM_SYMLINK_RETRY) {
-			psi = &current->next;
-		} else {
-			/* symlink was processed, remove from list */
-			*psi = current->next;
-			free(current);
-			/* if symlink was a directory, start over */
-			if (result == PHANTOM_SYMLINK_DIRECTORY)
-				psi = &phantom_symlinks;
+	if (!phantom_symlinks.root)
+		goto out;
+	if (full_path(&path, name)) {
+		error_errno("could not get full path of '%ls'", name);
+		goto out;
+	}
+	if (!recursive) {
+		strbuf_strip_suffix(&path, "/");
+		if (!append_from_cached_parent(&resolved, &path) &&
+		    mingw_strbuf_realpath(&resolved, path.buf) &&
+		    !strbuf_cmp(&path, &resolved)) {
+			struct strbuf parent = STRBUF_INIT;
+
+			strbuf_addbuf(&parent, &path);
+			strbuf_strip_file_from_path(&parent);
+			cache_directory(&parent, &parent);
+			strbuf_release(&parent);
+		}
+		if (resolved.len) {
+			cache_directory(&path, &resolved);
+			path_to_key(&resolved, 0);
 		}
 	}
+	path_to_key(&path, 0);
+	cb_each(&phantom_symlinks, (const uint8_t *)path.buf,
+		path.len + !recursive, collect_phantom_symlinks, &pending);
+	if (resolved.len && strbuf_cmp(&path, &resolved))
+		cb_each(&phantom_symlinks, (const uint8_t *)resolved.buf,
+			resolved.len + 1, collect_phantom_symlinks, &pending);
+	while (pending) {
+		struct phantom_symlink_info *psi = pending;
+
+		pending = psi->next;
+		if (process_phantom_symlink(psi->wtarget, psi->wlink) ==
+		    PHANTOM_SYMLINK_RETRY) {
+			if (remember_phantom_symlink(psi, psi->wlink))
+				free(psi);
+		} else
+			free(psi);
+	}
+out:
 	LeaveCriticalSection(&phantom_symlinks_cs);
+	strbuf_release(&path);
+	strbuf_release(&resolved);
 }
 
 static int create_phantom_symlink(wchar_t *wtarget, wchar_t *wlink)
 {
+	enum phantom_symlink_result result;
 	int len;
 
 	/* create file symlink */
@@ -469,40 +708,36 @@ static int create_phantom_symlink(wchar_t *wtarget, wchar_t *wlink)
 	}
 
 	/* convert to directory symlink if target exists */
-	switch (process_phantom_symlink(wtarget, wlink)) {
-	case PHANTOM_SYMLINK_RETRY: {
-		/* if target doesn't exist, add to phantom symlinks list */
+	EnterCriticalSection(&phantom_symlinks_cs);
+	result = process_phantom_symlink(wtarget, wlink);
+	if (result == PHANTOM_SYMLINK_RETRY) {
 		wchar_t wfullpath[MAX_LONG_PATH];
 		struct phantom_symlink_info *psi;
 
 		/* convert to absolute path to be independent of cwd */
 		len = GetFullPathNameW(wlink, MAX_LONG_PATH, wfullpath, NULL);
 		if (!len || len >= MAX_LONG_PATH) {
-			errno = err_win_to_posix(GetLastError());
+			errno = len ? ENAMETOOLONG :
+				err_win_to_posix(GetLastError());
+			LeaveCriticalSection(&phantom_symlinks_cs);
 			return -1;
 		}
 
 		/* over-allocate and fill phantom_symlink_info structure */
-		psi = xmalloc(sizeof(struct phantom_symlink_info) +
+		psi = xmalloc(sizeof(*psi) +
 			      sizeof(wchar_t) * (len + wcslen(wtarget) + 2));
 		psi->wlink = (wchar_t *)(psi + 1);
 		wcscpy(psi->wlink, wfullpath);
 		psi->wtarget = psi->wlink + len + 1;
 		wcscpy(psi->wtarget, wtarget);
-
-		EnterCriticalSection(&phantom_symlinks_cs);
-		psi->next = phantom_symlinks;
-		phantom_symlinks = psi;
-		LeaveCriticalSection(&phantom_symlinks_cs);
-		break;
+		if (remember_phantom_symlink(psi, wlink)) {
+			free(psi);
+			LeaveCriticalSection(&phantom_symlinks_cs);
+			return -1;
+		}
 	}
-	case PHANTOM_SYMLINK_DIRECTORY:
-		/* if we created a dir symlink, process other phantom symlinks */
-		process_phantom_symlinks();
-		break;
-	default:
-		break;
-	}
+	LeaveCriticalSection(&phantom_symlinks_cs);
+	process_phantom_symlinks(wlink, 1);
 	return 0;
 }
 
@@ -531,21 +766,81 @@ static wchar_t *normalize_ntpath(wchar_t *wbuf)
 	return wbuf;
 }
 
+/*
+ * Use SetFileInformationByHandle(FileDispositionInfo) to force legacy
+ * (non-POSIX) delete semantics. On Windows 11, DeleteFileW() uses POSIX
+ * delete semantics internally, allowing deletion even with active
+ * MapViewOfFile views. This helper simulates Windows 10 behavior where
+ * deletion fails if a file mapping exists.
+ *
+ * Returns nonzero on success (like DeleteFileW), 0 on failure.
+ */
+static int legacy_delete_file(const wchar_t *wpathname)
+{
+	FILE_DISPOSITION_INFO fdi = { TRUE };
+	DWORD gle;
+	HANDLE h = CreateFileW(wpathname, DELETE,
+			       FILE_SHARE_READ | FILE_SHARE_WRITE |
+			       FILE_SHARE_DELETE,
+			       NULL, OPEN_EXISTING,
+			       FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return 0;
+
+	if (SetFileInformationByHandle(h, FileDispositionInfo,
+				       &fdi, sizeof(fdi))) {
+		CloseHandle(h);
+		return 1;
+	}
+	gle = GetLastError();
+	CloseHandle(h);
+	SetLastError(gle);
+	return 0;
+}
+
+static int try_delete_file(const wchar_t *wpathname, int use_legacy)
+{
+	if (use_legacy)
+		return legacy_delete_file(wpathname);
+	return DeleteFileW(wpathname);
+}
+
 int mingw_unlink(const char *pathname, int handle_in_use_error)
 {
-	int tries = 0;
+	static int use_legacy_delete = -1;
+	int tries = 0, ret = -1;
 	wchar_t wpathname[MAX_LONG_PATH];
+	struct strbuf target = STRBUF_INIT;
+	char first;
 	if (xutftowcs_long_path(wpathname, pathname) < 0)
 		return -1;
 
-	if (DeleteFileW(wpathname))
-		return 0;
+	invalidate_phantom_directories();
+	if (use_legacy_delete < 0)
+		use_legacy_delete = git_env_bool("GIT_TEST_LEGACY_DELETE", 0);
+
+	/*
+	 * Pending links through this symlink are indexed under its old target.
+	 * Re-index that subtree after removal, before checkout replaces it.
+	 * Like process_phantom_symlink(), do not follow slash-prefixed targets.
+	 */
+	EnterCriticalSection(&phantom_symlinks_cs);
+	if (phantom_symlinks.root &&
+	    (GetFileAttributesW(wpathname) & FILE_ATTRIBUTE_REPARSE_POINT) &&
+	    readlink(pathname, &first, 1) == 1 && !is_dir_sep(first)) {
+		strbuf_add_absolute_path(&target, pathname);
+		path_to_key(&target, 1);
+	}
+	LeaveCriticalSection(&phantom_symlinks_cs);
+
+	if (try_delete_file(wpathname, use_legacy_delete))
+		goto success;
 
 	do {
 		/* read-only files cannot be removed */
 		_wchmod(wpathname, 0666);
-		if (!_wunlink(wpathname))
-			return 0;
+		if (try_delete_file(wpathname, use_legacy_delete))
+			goto success;
 		if (!is_file_in_use_error(GetLastError()))
 			break;
 		/*
@@ -554,13 +849,22 @@ int mingw_unlink(const char *pathname, int handle_in_use_error)
 		 * same error we get if a file is in use (already checked above).
 		 */
 		if (!_wrmdir(wpathname))
-			return 0;
+			goto success;
 
 		if (!handle_in_use_error)
-			return -1;
+			goto out;
 	} while (retry_ask_yes_no(&tries, "Unlink of file '%s' failed. "
 			"Should I try again?", pathname));
-	return -1;
+	goto out;
+
+success:
+	ret = 0;
+	invalidate_phantom_directories();
+	if (target.len && xutftowcs_long_path(wpathname, target.buf) >= 0)
+		process_phantom_symlinks(wpathname, 1);
+out:
+	strbuf_release(&target);
+	return ret;
 }
 
 static int is_dir_empty(const wchar_t *wpath)
@@ -613,9 +917,11 @@ int mingw_rmdir(const char *pathname)
 	if (xutftowcs_long_path(wpathname, pathname) < 0)
 		return -1;
 
+	invalidate_phantom_directories();
 	do {
 		if (!_wrmdir(wpathname)) {
 			invalidate_lstat_cache();
+			invalidate_phantom_directories();
 			return 0;
 		}
 		if (!is_file_in_use_error(GetLastError()))
@@ -693,7 +999,7 @@ int mingw_mkdir(const char *path, int mode UNUSED)
 
 	ret = _wmkdir(wpath);
 	if (!ret)
-		process_phantom_symlinks();
+		process_phantom_symlinks(wpath, 0);
 	if (!ret && needs_hiding(path))
 		return set_hidden_flag(wpath, 1);
 	return ret;
@@ -875,7 +1181,7 @@ int mingw_open (const char *filename, int oflags, ...)
 	 * Only set append_atomically to default value(1) when repo is initialized
 	 * and fail to get config value
 	 */
-	if (append_atomically < 0 && the_repository && the_repository->commondir &&
+	if ((oflags & O_APPEND) && append_atomically < 0 && the_repository && the_repository->commondir &&
 		repo_config_get_bool(the_repository, "windows.appendatomically", &append_atomically))
 		append_atomically = 1;
 
@@ -1104,7 +1410,11 @@ ssize_t mingw_write(int fd, const void *buf, size_t len)
 int mingw_access(const char *filename, int mode)
 {
 	wchar_t wfilename[MAX_LONG_PATH];
-	if (!strcmp("nul", filename) || !strcmp("/dev/null", filename))
+	/*
+	 * Cannot use fspathcmp() here, this function is called _while reading
+	 * the config_.
+	 */
+	if (!strcasecmp("nul", filename) || !strcmp("/dev/null", filename))
 		return 0;
 	if (xutftowcs_long_path(wfilename, filename) < 0)
 		return -1;
@@ -1122,7 +1432,7 @@ int mingw_chdir(const char *dirname)
 	if (xutftowcs_long_path(wdirname, dirname) < 0)
 		return -1;
 
-	if (has_symlinks) {
+	if (repo_has_symlinks(the_repository)) {
 		HANDLE hnd = CreateFileW(wdirname, 0,
 				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
 				OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -1509,6 +1819,9 @@ revert_attrs:
 size_t mingw_strftime(char *s, size_t max,
 		      const char *format, const struct tm *tm)
 {
+#ifdef _UCRT
+	size_t ret = strftime(s, max, format, tm);
+#else
 	/* a pointer to the original strftime in case we can't find the UCRT version */
 	static size_t (*fallback)(char *, size_t, const char *, const struct tm *) = strftime;
 	size_t ret;
@@ -1519,6 +1832,7 @@ size_t mingw_strftime(char *s, size_t max,
 		ret = strftime(s, max, format, tm);
 	else
 		ret = fallback(s, max, format, tm);
+#endif
 
 	if (!ret && errno == EINVAL)
 		die("invalid strftime format: '%s'", format);
@@ -1590,14 +1904,14 @@ struct tm *localtime_r(const time_t *timep, struct tm *result)
 
 char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
 {
-	wchar_t wpath[MAX_PATH];
+	wchar_t wpath[MAX_LONG_PATH];
 	HANDLE h;
 	DWORD ret;
 	int len;
 	const char *last_component = NULL;
 	char *append = NULL;
 
-	if (xutftowcs_path(wpath, path) < 0)
+	if (xutftowcs_long_path(wpath, path) < 0)
 		return NULL;
 
 	h = CreateFileW(wpath, 0,
@@ -1607,9 +1921,11 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path)
 	/*
 	 * strbuf_realpath() allows the last path component to not exist. If
 	 * that is the case, now it's time to try without last component.
+	 * Do not mistake a dangling symlink for a missing path component.
 	 */
 	if (h == INVALID_HANDLE_VALUE &&
-	    GetLastError() == ERROR_FILE_NOT_FOUND) {
+	    GetLastError() == ERROR_FILE_NOT_FOUND &&
+	    GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
 		/* cut last component off of `wpath` */
 		wchar_t *p = wpath + wcslen(wpath);
 
@@ -2484,10 +2800,8 @@ int mingw_kill(pid_t pid, int sig)
 			}
 			ret = terminate_process_tree(h, 128 + sig);
 		}
-		if (ret) {
+		if (ret)
 			errno = err_win_to_posix(GetLastError());
-			CloseHandle(h);
-		}
 		return ret;
 	} else if (pid > 0 && sig == 0) {
 		HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
@@ -2495,6 +2809,16 @@ int mingw_kill(pid_t pid, int sig)
 			CloseHandle(h);
 			return 0;
 		}
+		/*
+		 * OpenProcess returns ERROR_INVALID_PARAMETER for
+		 * non-existent PIDs. Map this to ESRCH for POSIX
+		 * compatibility with kill(pid, 0).
+		 */
+		if (GetLastError() == ERROR_INVALID_PARAMETER)
+			errno = ESRCH;
+		else
+			errno = err_win_to_posix(GetLastError());
+		return -1;
 	}
 
 	errno = EINVAL;
@@ -2934,11 +3258,12 @@ int mingw_rename(const char *pold, const char *pnew)
 	if (wpnew_len < 0)
 		return -1;
 
+	invalidate_phantom_directories();
 repeat:
 	if (supports_file_rename_info_ex) {
 		/*
 		 * Our minimum required Windows version is still set to Windows
-		 * Vista. We thus have to declare required infrastructure for
+		 * 8.1. We thus have to declare required infrastructure for
 		 * FileRenameInfoEx ourselves until we bump _WIN32_WINNT to
 		 * 0x0A00. Furthermore, we have to handle cases where the
 		 * FileRenameInfoEx call isn't supported yet.
@@ -2986,8 +3311,10 @@ repeat:
 						     &rename_info, sizeof(rename_info));
 		gle = GetLastError();
 		CloseHandle(old_handle);
-		if (success)
+		if (success) {
+			invalidate_phantom_directories();
 			return 0;
+		}
 
 		/*
 		 * When we see ERROR_INVALID_PARAMETER we can assume that the
@@ -3010,8 +3337,10 @@ repeat:
 		 */
 	} else {
 		if (MoveFileExW(wpold, wpnew,
-				MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+			invalidate_phantom_directories();
 			return 0;
+		}
 		gle = GetLastError();
 	}
 
@@ -3027,6 +3356,7 @@ repeat:
 			if (MoveFileExW(wpold, wpnew,
 					MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
 				SetFileAttributesW(wpnew, attrsold);
+				invalidate_phantom_directories();
 				return 0;
 			}
 			gle = GetLastError();
@@ -3051,8 +3381,10 @@ repeat:
 			if (attrsold == INVALID_FILE_ATTRIBUTES ||
 			    !(attrsold & FILE_ATTRIBUTE_DIRECTORY))
 				errno = EISDIR;
-			else if (!_wrmdir(wpnew))
+			else if (!_wrmdir(wpnew)) {
+				invalidate_phantom_directories();
 				goto repeat;
+			}
 			return -1;
 		}
 		if ((attrs & FILE_ATTRIBUTE_READONLY) &&
@@ -3385,7 +3717,7 @@ int mingw_create_symlink(struct index_state *index, const char *target, const ch
 	int len;
 
 	/* fail if symlinks are disabled or API is not supported (WinXP) */
-	if (!has_symlinks) {
+	if (!repo_has_symlinks(the_repository)) {
 		errno = ENOSYS;
 		return -1;
 	}
@@ -3408,6 +3740,7 @@ int mingw_create_symlink(struct index_state *index, const char *target, const ch
 	case SYMLINK_TYPE_FILE:
 		if (!CreateSymbolicLinkW(wlink, wtarget, symlink_file_flags))
 			break;
+		process_phantom_symlinks(wlink, 1);
 		return 0;
 	case SYMLINK_TYPE_DIRECTORY:
 		if (!CreateSymbolicLinkW(wlink, wtarget,
@@ -3415,7 +3748,7 @@ int mingw_create_symlink(struct index_state *index, const char *target, const ch
 			break;
 		/* There may be dangling phantom symlinks that point at this
 		 * one, which should now morph into directory symlinks. */
-		process_phantom_symlinks();
+		process_phantom_symlinks(wlink, 1);
 		return 0;
 	default:
 		BUG("unhandled symlink type");
@@ -3754,15 +4087,23 @@ static void setup_windows_environment(void)
 
 	if (!getenv("LC_ALL") && !getenv("LC_CTYPE") && !getenv("LANG"))
 		setenv("LC_CTYPE", "C.UTF-8", 1);
+}
 
+int mingw_platform_has_symlinks(void)
+{
+	static int has_symlinks = -1;
 	/*
 	 * Change 'core.symlinks' default to false, unless native symlinks are
 	 * enabled in MSys2 (via 'MSYS=winsymlinks:nativestrict'). Thus we can
 	 * run the test suite (which doesn't obey config files) with or without
 	 * symlink support.
 	 */
-	if (!(tmp = getenv("MSYS")) || !strstr(tmp, "winsymlinks:nativestrict"))
-		has_symlinks = 0;
+	if (has_symlinks < 0) {
+		const char *tmp = getenv("MSYS");
+		has_symlinks = (tmp && strstr(tmp, "winsymlinks:nativestrict")) ? 1 : 0;
+	}
+
+	return has_symlinks;
 }
 
 static void get_current_user_sid(PSID *sid, HANDLE *linked_token)
@@ -3844,18 +4185,42 @@ static int acls_supported(const char *path)
 	return 0;
 }
 
+int is_valid_windows_path_element(wchar_t ch)
+{
+	// cf. https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+	// Windows disallows ASCII control characters 0x00–0x1F
+	if (ch < 0x1F)
+		return false;
+
+	// Windows reserved path characters
+	switch (ch) {
+	case L'<':
+	case L'>':
+	case L':':
+	case L'"':
+	case L'/':
+	case L'\\':
+	case L'|':
+	case L'?':
+	case L'*':
+		return 0;
+	default:
+		return 1;
+	}
+}
+
 int is_path_owned_by_current_sid(const char *path, struct strbuf *report)
 {
-	WCHAR wpath[MAX_PATH];
+	WCHAR wpath[MAX_LONG_PATH];
 	PSID sid = NULL;
 	PSECURITY_DESCRIPTOR descriptor = NULL;
 	DWORD err;
 
-	static wchar_t home[MAX_PATH];
+	static wchar_t home[MAX_LONG_PATH];
 
 	int result = 0;
 
-	if (xutftowcs_path(wpath, path) < 0)
+	if (xutftowcs_long_path(wpath, path) < 0)
 		return 0;
 
 	/*
@@ -3871,6 +4236,15 @@ int is_path_owned_by_current_sid(const char *path, struct strbuf *report)
 	}
 	if (!wcsicmp(wpath, home))
 		return 1;
+
+	/* Do not leak NTLM hashes, UNC paths etc. are generally problematic */
+	if (wpath[0] == L'\\' && !is_valid_windows_path_element(wpath[1])) {
+		if (report)
+			strbuf_addf(report,
+				    "'%s' may refer to a non-local directory",
+				    path);
+		return 0;
+	}
 
 	/* Get the owner SID */
 	err = GetNamedSecurityInfoW(wpath, SE_FILE_OBJECT,
@@ -3971,7 +4345,7 @@ int is_valid_win32_path(const char *path, int allow_literal_nul)
 	const char *p = path;
 	int preceding_space_or_period = 0, i = 0, periods = 0;
 
-	if (!protect_ntfs)
+	if (!repo_protect_ntfs(the_repository))
 		return 1;
 
 	skip_dos_drive_prefix((char **)&path);

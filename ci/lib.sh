@@ -215,6 +215,7 @@ then
 	test macos != "$CI_OS_NAME" || CI_OS_NAME=osx
 	CI_REPO_SLUG="$GITHUB_REPOSITORY"
 	CI_JOB_ID="$GITHUB_RUN_ID"
+	CI_EVENT="$GITHUB_EVENT_NAME"
 	CC="${CC_PACKAGE:-${CC:-gcc}}"
 	DONT_SKIP_TAGS=t
 	handle_failed_tests () {
@@ -226,19 +227,28 @@ then
 	cache_dir="$HOME/none"
 
 	GIT_TEST_OPTS="--github-workflow-markup"
-	JOBS=10
 
 	distro=$(echo "$CI_JOB_IMAGE" | tr : -)
 elif test true = "$GITLAB_CI"
 then
+	# This environment is multiple kB in size and may cause us to exceed
+	# xargs(1) limits on Windows.
+	unset GITLAB_FEATURES
+
 	CI_TYPE=gitlab-ci
 	CI_BRANCH="$CI_COMMIT_REF_NAME"
 	CI_COMMIT="$CI_COMMIT_SHA"
 
+	case "$CI_PIPELINE_SOURCE" in
+	merge_request_event)
+		CI_EVENT=pull_request;;
+	*)
+		CI_EVENT="$CI_PIPELINE_SOURCE";;
+	esac
+
 	case "$OS,$CI_JOB_IMAGE" in
 	Windows_NT,*)
 		CI_OS_NAME=windows
-		JOBS=$NUMBER_OF_PROCESSORS
 		;;
 	*,macos-*)
 		# GitLab CI has Python installed via multiple package managers,
@@ -248,11 +258,9 @@ then
 		export PATH="$(brew --prefix)/bin:$PATH"
 
 		CI_OS_NAME=osx
-		JOBS=$(nproc)
 		;;
-	*,alpine:*|*,fedora:*|*,ubuntu:*|*,i386/ubuntu:*)
+	*,almalinux:*|*,alpine:*|*,debian:*|*,fedora:*|*,ubuntu:*|*,i386/debian:*)
 		CI_OS_NAME=linux
-		JOBS=$(nproc)
 		;;
 	*)
 		echo "Could not identify OS image" >&2
@@ -278,6 +286,19 @@ else
 	env >&2
 	exit 1
 fi
+
+case "$CI_OS_NAME" in
+windows|windows_nt)
+	JOBS=$NUMBER_OF_PROCESSORS
+	;;
+osx)
+	JOBS=$(sysctl -n hw.logicalcpu)
+	;;
+*)
+	JOBS=$(nproc)
+	;;
+esac
+JOBS=$((2 * JOBS))
 
 MAKEFLAGS="$MAKEFLAGS --jobs=$JOBS"
 GIT_PROVE_OPTS="--timer --jobs $JOBS"
@@ -309,6 +330,18 @@ export DEVELOPER=1
 export DEFAULT_TEST_TARGET=prove
 export GIT_TEST_CLONE_2GB=true
 export SKIP_DASHED_BUILT_INS=YesPlease
+
+# In order to give maximum test coverage to contributor builds,
+# preferrably even before the changes consume public review bandwidth,
+# enable "expensive" tests for PR events.
+# In order to catch bugs introduced at integration time by mismerges,
+# enable the long tests for pushes to the integration branches as well.
+test -z "$MSYSTEM" ||
+case "$CI_EVENT,$CI_BRANCH" in
+pull_request,*|push,*next*|push,*master*|push,*main*|push,*maint*)
+	export GIT_TEST_LONG=${GIT_TEST_LONG:-true}
+	;;
+esac
 
 case "$distro" in
 ubuntu-*)

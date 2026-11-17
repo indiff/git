@@ -304,7 +304,7 @@ static struct lline *coalesce_lines(struct lline *base, int *lenbase,
 
 static char *grab_blob(struct repository *r,
 		       const struct object_id *oid, unsigned int mode,
-		       unsigned long *size, struct userdiff_driver *textconv,
+		       size_t *size, struct userdiff_driver *textconv,
 		       const char *path)
 {
 	char *blob;
@@ -429,7 +429,7 @@ static void combine_diff(struct repository *r,
 	xdemitconf_t xecfg;
 	mmfile_t parent_file;
 	struct combine_diff_state state;
-	unsigned long sz;
+	size_t sz;
 
 	if (result_deleted)
 		return; /* result deleted */
@@ -666,7 +666,7 @@ static int make_hunks(struct sline *sline, unsigned long cnt,
 		 *   (-) line, which records from what parents the line
 		 *       was removed; this line does not appear in the result.
 		 * then check the set of parents the result has difference
-		 * from, from all lines.  If there are lines that has
+		 * from, from all lines.  If there are lines that have
 		 * different set of parents that the result has differences
 		 * from, that means we have more than two versions.
 		 *
@@ -1013,7 +1013,7 @@ static void show_patch_diff(struct combine_diff_path *elem, int num_parent,
 			    struct rev_info *rev)
 {
 	struct diff_options *opt = &rev->diffopt;
-	unsigned long result_size, cnt, lno;
+	size_t result_size, cnt, lno;
 	int result_deleted = 0;
 	char *result, *cp;
 	struct sline *sline; /* survived lines */
@@ -1078,7 +1078,7 @@ static void show_patch_diff(struct combine_diff_path *elem, int num_parent,
 			/* if symlinks don't work, assume symlink if all parents
 			 * are symlinks
 			 */
-			is_file = has_symlinks;
+			is_file = repo_has_symlinks(rev->repo);
 			for (i = 0; !is_file && i < num_parent; i++)
 				is_file = !S_ISLNK(elem->parent[i].mode);
 			if (!is_file)
@@ -1132,7 +1132,7 @@ static void show_patch_diff(struct combine_diff_path *elem, int num_parent,
 		is_binary = buffer_is_binary(result, result_size);
 		for (i = 0; !is_binary && i < num_parent; i++) {
 			char *buf;
-			unsigned long size;
+			size_t size;
 			buf = grab_blob(opt->repo,
 					&elem->parent[i].oid,
 					elem->parent[i].mode,

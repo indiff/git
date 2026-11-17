@@ -86,7 +86,7 @@ struct ref_trailer_buf {
 static struct expand_data {
 	struct object_id oid;
 	enum object_type type;
-	unsigned long size;
+	size_t size;
 	off_t disk_size;
 	struct object_id delta_base_oid;
 	void *content;
@@ -1753,7 +1753,7 @@ static void grab_person(const char *who, struct atom_value *val, int deref, void
 		    (starts_with(name + wholen, "email") &&
 		    (atom->u.email_option.option & EO_MAILMAP))) {
 			if (!mailmap.items)
-				read_mailmap(&mailmap);
+				read_mailmap(the_repository, &mailmap);
 			strbuf_addstr(&mailmap_buf, buf);
 			apply_mailmap_to_header(&mailmap_buf, headers, &mailmap);
 			wholine = find_wholine(who, wholen, mailmap_buf.buf);
@@ -2173,32 +2173,34 @@ static inline char *copy_advance(char *dst, const char *src)
 	return dst;
 }
 
-static const char *lstrip_ref_components(const char *refname, int len)
+static int normalize_component_count(const char *refname, int len)
 {
-	long remaining = len;
-	const char *start = xstrdup(refname);
-	const char *to_free = start;
-
 	if (len < 0) {
-		int i;
-		const char *p = refname;
+		int slashes = 0;
 
-		/* Find total no of '/' separated path-components */
-		for (i = 0; p[i]; p[i] == '/' ? i++ : *p++)
-			;
+		for (const char *p = refname; *p; p++) {
+			if (*p == '/')
+				slashes++;
+		}
+
 		/*
 		 * The number of components we need to strip is now
 		 * the total minus the components to be left (Plus one
 		 * because we count the number of '/', but the number
 		 * of components is one more than the no of '/').
 		 */
-		remaining = i + len + 1;
+		len = slashes + len + 1;
 	}
+	return len;
+}
+
+static const char *lstrip_ref_components(const char *refname, int len)
+{
+	int remaining = normalize_component_count(refname, len);
 
 	while (remaining > 0) {
-		switch (*start++) {
+		switch (*refname++) {
 		case '\0':
-			free((char *)to_free);
 			return xstrdup("");
 		case '/':
 			remaining--;
@@ -2206,42 +2208,21 @@ static const char *lstrip_ref_components(const char *refname, int len)
 		}
 	}
 
-	start = xstrdup(start);
-	free((char *)to_free);
-	return start;
+	return xstrdup(refname);
 }
 
 static const char *rstrip_ref_components(const char *refname, int len)
 {
-	long remaining = len;
-	const char *start = xstrdup(refname);
-	const char *to_free = start;
+	int remaining = normalize_component_count(refname, len);
+	const char *end = refname + strlen(refname);
 
-	if (len < 0) {
-		int i;
-		const char *p = refname;
-
-		/* Find total no of '/' separated path-components */
-		for (i = 0; p[i]; p[i] == '/' ? i++ : *p++)
-			;
-		/*
-		 * The number of components we need to strip is now
-		 * the total minus the components to be left (Plus one
-		 * because we count the number of '/', but the number
-		 * of components is one more than the no of '/').
-		 */
-		remaining = i + len + 1;
-	}
-
-	while (remaining-- > 0) {
-		char *p = strrchr(start, '/');
-		if (!p) {
-			free((char *)to_free);
+	while (remaining > 0) {
+		if (end == refname)
 			return xstrdup("");
-		} else
-			p[0] = '\0';
+		if (*--end == '/')
+			remaining--;
 	}
-	return start;
+	return xmemdupz(refname, end - refname);
 }
 
 static const char *show_ref(struct refname_atom *atom, const char *refname)
@@ -2421,7 +2402,7 @@ static void lazy_init_worktree_map(void)
 	if (ref_to_worktree_map.worktrees)
 		return;
 
-	ref_to_worktree_map.worktrees = get_worktrees();
+	ref_to_worktree_map.worktrees = get_worktrees(the_repository);
 	hashmap_init(&(ref_to_worktree_map.map), ref_to_worktree_map_cmpfnc, NULL, 0);
 	populate_worktree_map(&(ref_to_worktree_map.map), ref_to_worktree_map.worktrees);
 }
@@ -2763,6 +2744,72 @@ static int filter_exclude_match(struct ref_filter *filter, const char *refname)
 	return match_pattern(filter->exclude.v, refname, filter->ignore_case);
 }
 
+static const char *short_upstream_name(const char *full_ref)
+{
+	const char *short_name = full_ref;
+
+	if (!skip_prefix(short_name, "refs/heads/", &short_name))
+		skip_prefix(short_name, "refs/remotes/", &short_name);
+	return short_name;
+}
+
+/*
+ * Match the configured upstream of a branch against the registered
+ * --forked patterns. Exact patterns are compared against the full
+ * upstream refname so they are unambiguous; glob patterns are matched
+ * against the abbreviated upstream so that a glob such as origin/...
+ * works as typed.
+ */
+static int filter_forked_match(struct ref_filter *filter, const char *refname)
+{
+	const char *short_name;
+	struct branch *branch;
+	const char *upstream;
+
+	if (!skip_prefix(refname, "refs/heads/", &short_name))
+		return 0;
+	branch = branch_get(short_name);
+	if (!branch)
+		return 0;
+	upstream = branch_get_upstream(branch, NULL);
+	if (!upstream)
+		return 0;
+
+	for (size_t i = 0; i < filter->forked.nr; i++) {
+		const char *pattern = filter->forked.v[i];
+		if (has_glob_specials(pattern)) {
+			if (!wildmatch(pattern, short_upstream_name(upstream),
+				       WM_PATHNAME))
+				return 1;
+		} else if (!strcmp(pattern, upstream)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+int ref_filter_forked_add(struct ref_filter *filter, const char *arg)
+{
+	struct object_id oid;
+	char *full_ref = NULL;
+
+	if (has_glob_specials(arg)) {
+		strvec_push(&filter->forked, arg);
+		return 0;
+	}
+
+	if (repo_dwim_ref(the_repository, arg, strlen(arg), &oid,
+			  &full_ref, 0) == 1 &&
+	    (starts_with(full_ref, "refs/heads/") ||
+	     starts_with(full_ref, "refs/remotes/"))) {
+		strvec_push(&filter->forked, full_ref);
+		free(full_ref);
+		return 0;
+	}
+	free(full_ref);
+	return -1;
+}
+
 /*
  * We need to seek to the reference right after a given marker but excluding any
  * matching references. So we seek to the lexicographically next reference.
@@ -2781,7 +2828,7 @@ static int start_ref_iterator_after(struct ref_iterator *iter, const char *marke
 	return ret;
 }
 
-static int for_each_fullref_with_seek(struct ref_filter *filter, each_ref_fn cb,
+static int for_each_fullref_with_seek(struct ref_filter *filter, refs_for_each_cb cb,
 				       void *cb_data, unsigned int flags)
 {
 	struct ref_iterator *iter;
@@ -2804,13 +2851,17 @@ static int for_each_fullref_with_seek(struct ref_filter *filter, each_ref_fn cb,
  * pattern match, so the callback still has to match each ref individually.
  */
 static int for_each_fullref_in_pattern(struct ref_filter *filter,
-				       each_ref_fn cb,
+				       refs_for_each_cb cb,
 				       void *cb_data)
 {
+	struct refs_for_each_ref_options opts = {
+		.exclude_patterns = filter->exclude.v,
+	};
+
 	if (filter->kind & FILTER_REFS_ROOT_REFS) {
 		/* In this case, we want to print all refs including root refs. */
 		return for_each_fullref_with_seek(filter, cb, cb_data,
-						  DO_FOR_EACH_INCLUDE_ROOT_REFS);
+						  REFS_FOR_EACH_INCLUDE_ROOT_REFS);
 	}
 
 	if (!filter->match_as_path) {
@@ -2836,10 +2887,9 @@ static int for_each_fullref_in_pattern(struct ref_filter *filter,
 		return for_each_fullref_with_seek(filter, cb, cb_data, 0);
 	}
 
-	return refs_for_each_fullref_in_prefixes(get_main_ref_store(the_repository),
-						 NULL, filter->name_patterns,
-						 filter->exclude.v,
-						 cb, cb_data);
+	return refs_for_each_ref_in_prefixes(get_main_ref_store(the_repository),
+					     filter->name_patterns, &opts,
+					     cb, cb_data);
 }
 
 /*
@@ -2993,6 +3043,9 @@ static struct ref_array_item *apply_ref_filter(const struct reference *ref,
 		return NULL;
 
 	if (filter->points_at.nr && !match_points_at(&filter->points_at, ref->oid, ref->name))
+		return NULL;
+
+	if (filter->forked.nr && !filter_forked_match(filter, ref->name))
 		return NULL;
 
 	/*
@@ -3303,7 +3356,7 @@ void filter_is_base(struct repository *r,
 	free(bases);
 }
 
-static int do_filter_refs(struct ref_filter *filter, unsigned int type, each_ref_fn fn, void *cb_data)
+static int do_filter_refs(struct ref_filter *filter, unsigned int type, refs_for_each_cb fn, void *cb_data)
 {
 	const char *prefix = NULL;
 	int ret = 0;
@@ -3332,15 +3385,14 @@ static int do_filter_refs(struct ref_filter *filter, unsigned int type, each_ref
 
 	if (prefix) {
 		struct ref_iterator *iter;
+		struct ref_store *store = get_main_ref_store(the_repository);
 
-		iter = refs_ref_iterator_begin(get_main_ref_store(the_repository),
-					       "", NULL, 0, 0);
-
-		if (filter->start_after)
+		if (filter->start_after) {
+			iter = refs_ref_iterator_begin(store, "", NULL, 0, 0);
 			ret = start_ref_iterator_after(iter, filter->start_after);
-		else
-			ret = ref_iterator_seek(iter, prefix,
-						REF_ITERATOR_SEEK_SET_PREFIX);
+		} else {
+			iter = refs_ref_iterator_begin(store, prefix, NULL, 0, 0);
+		}
 
 		if (!ret)
 			ret = do_for_each_ref_iterator(iter, fn, cb_data);
@@ -3781,10 +3833,11 @@ void ref_filter_init(struct ref_filter *filter)
 void ref_filter_clear(struct ref_filter *filter)
 {
 	strvec_clear(&filter->exclude);
+	strvec_clear(&filter->forked);
 	oid_array_clear(&filter->points_at);
-	free_commit_list(filter->with_commit);
-	free_commit_list(filter->no_commit);
-	free_commit_list(filter->reachable_from);
-	free_commit_list(filter->unreachable_from);
+	commit_list_free(filter->with_commit);
+	commit_list_free(filter->no_commit);
+	commit_list_free(filter->reachable_from);
+	commit_list_free(filter->unreachable_from);
 	ref_filter_init(filter);
 }

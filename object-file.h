@@ -4,6 +4,11 @@
 #include "git-zlib.h"
 #include "object.h"
 #include "odb.h"
+#include "odb/source-loose.h"
+#include "odb/transaction.h"
+
+/* The maximum size for an object header. */
+#define MAX_HEADER_LEN 32
 
 struct index_state;
 
@@ -17,74 +22,13 @@ int index_fd(struct index_state *istate, struct object_id *oid, int fd, struct s
 int index_path(struct index_state *istate, struct object_id *oid, const char *path, struct stat *st, unsigned flags);
 
 struct object_info;
-struct odb_read_stream;
 struct odb_source;
-
-struct odb_source_loose {
-	struct odb_source *source;
-
-	/*
-	 * Used to store the results of readdir(3) calls when we are OK
-	 * sacrificing accuracy due to races for speed. That includes
-	 * object existence with OBJECT_INFO_QUICK, as well as
-	 * our search for unique abbreviated hashes. Don't use it for tasks
-	 * requiring greater accuracy!
-	 *
-	 * Be sure to call odb_load_loose_cache() before using.
-	 */
-	uint32_t subdir_seen[8]; /* 256 bits */
-	struct oidtree *cache;
-
-	/* Map between object IDs for loose objects. */
-	struct loose_object_map *map;
-};
-
-struct odb_source_loose *odb_source_loose_new(struct odb_source *source);
-void odb_source_loose_free(struct odb_source_loose *loose);
-
-/* Reprepare the loose source by emptying the loose object cache. */
-void odb_source_loose_reprepare(struct odb_source *source);
-
-int odb_source_loose_read_object_info(struct odb_source *source,
-				      const struct object_id *oid,
-				      struct object_info *oi, int flags);
-
-int odb_source_loose_read_object_stream(struct odb_read_stream **out,
-					struct odb_source *source,
-					const struct object_id *oid);
-
-/*
- * Return true iff an object database source has a loose object
- * with the specified name.  This function does not respect replace
- * references.
- */
-int odb_source_loose_has_object(struct odb_source *source,
-				const struct object_id *oid);
-
-int odb_source_loose_freshen_object(struct odb_source *source,
-				    const struct object_id *oid);
-
-int odb_source_loose_write_object(struct odb_source *source,
-				  const void *buf, size_t len,
-				  enum object_type type, struct object_id *oid,
-				  struct object_id *compat_oid_in, unsigned flags);
-
-int odb_source_loose_write_stream(struct odb_source *source,
-				  struct odb_write_stream *stream, size_t len,
-				  struct object_id *oid);
-
-/*
- * Populate and return the loose object cache array corresponding to the
- * given object ID.
- */
-struct oidtree *odb_source_loose_cache(struct odb_source *source,
-				       const struct object_id *oid);
 
 /*
  * Put in `buf` the name of the file in the local object database that
  * would be used to store a loose object with the specified oid.
  */
-const char *odb_loose_path(struct odb_source *source,
+const char *odb_loose_path(struct odb_source_loose *source,
 			   struct strbuf *buf,
 			   const struct object_id *oid);
 
@@ -124,18 +68,13 @@ int for_each_loose_file_in_source(struct odb_source *source,
 				  each_loose_cruft_fn cruft_cb,
 				  each_loose_subdir_fn subdir_cb,
 				  void *data);
-
-/*
- * Iterate over all accessible loose objects without respect to
- * reachability. By default, this includes both local and alternate objects.
- * The order in which objects are visited is unspecified.
- *
- * Any flags specific to packs are ignored.
- */
-int for_each_loose_object(struct object_database *odb,
-			  each_loose_object_fn, void *,
-			  enum for_each_object_flags flags);
-
+int for_each_file_in_obj_subdir(unsigned int subdir_nr,
+				struct strbuf *path,
+				const struct git_hash_algo *algop,
+				each_loose_object_fn obj_cb,
+				each_loose_cruft_fn cruft_cb,
+				each_loose_subdir_fn subdir_cb,
+				void *data);
 
 /**
  * format_object_header() is a thin wrapper around s xsnprintf() that
@@ -145,9 +84,6 @@ int for_each_loose_object(struct object_database *odb,
 int format_object_header(char *str, size_t size, enum object_type type,
 			 size_t objsize);
 
-int force_object_loose(struct odb_source *source,
-		       const struct object_id *oid, time_t mtime);
-
 /**
  * With in-core object data in "buf", rehash it to make sure the
  * object name actually matches "oid" to detect object corruption.
@@ -156,7 +92,7 @@ int force_object_loose(struct odb_source *source,
  * what we expected, but it might also indicate another error.
  */
 int check_object_signature(struct repository *r, const struct object_id *oid,
-			   void *map, unsigned long size,
+			   void *map, size_t size,
 			   enum object_type type);
 
 /**
@@ -164,7 +100,9 @@ int check_object_signature(struct repository *r, const struct object_id *oid,
  * Try reading the object named with "oid" using
  * the streaming interface and rehash it to do the same.
  */
-int stream_object_signature(struct repository *r, const struct object_id *oid);
+int stream_object_signature(struct repository *r,
+			    struct odb_stream *stream,
+			    const struct object_id *oid);
 
 enum finalize_object_file_flags {
 	FOF_SKIP_COLLISION_CHECK = 1,
@@ -181,7 +119,8 @@ void hash_object_file(const struct git_hash_algo *algo, const void *buf,
 		      struct object_id *oid);
 
 /* Helper to check and "touch" a file */
-int check_and_freshen_file(const char *fn, int freshen);
+int check_and_freshen_file(const char *fn, int freshen,
+			   const time_t *mtime);
 
 /*
  * Open the loose object at path, check its hash, and return the contents,
@@ -198,20 +137,48 @@ int read_loose_object(struct repository *repo,
 		      void **contents,
 		      struct object_info *oi);
 
+enum unpack_loose_header_result {
+	ULHR_OK,
+	ULHR_BAD,
+	ULHR_TOO_LONG,
+};
+
+/**
+ * unpack_loose_header() initializes the data stream needed to unpack
+ * a loose object header.
+ *
+ * Returns:
+ *
+ * - ULHR_OK on success
+ * - ULHR_BAD on error
+ * - ULHR_TOO_LONG if the header was too long
+ *
+ * It will only parse up to MAX_HEADER_LEN bytes.
+ */
+enum unpack_loose_header_result unpack_loose_header(git_zstream *stream,
+						    unsigned char *map,
+						    size_t mapsize,
+						    void *buffer,
+						    size_t bufsiz);
+void *unpack_loose_rest(git_zstream *stream,
+			void *buffer, size_t size,
+			const struct object_id *oid);
+
+int parse_loose_header(const char *hdr, struct object_info *oi);
+
 struct odb_transaction;
 
 /*
  * Tell the object database to optimize for adding
- * multiple objects. object_file_transaction_commit must be called
- * to make new objects visible. If a transaction is already
- * pending, NULL is returned.
+ * multiple objects. odb_transaction_files_commit must be called
+ * to make new objects visible.
  */
-struct odb_transaction *object_file_transaction_begin(struct odb_source *source);
+int odb_transaction_files_begin(struct odb_source *source,
+				struct odb_transaction **out,
+				enum odb_transaction_flags flags);
 
-/*
- * Tell the object database to make any objects from the
- * current transaction visible.
- */
-void object_file_transaction_commit(struct odb_transaction *transaction);
+int odb_transaction_files_prepare(struct odb_transaction *base);
+void odb_transaction_files_fsync(struct odb_transaction *base,
+				 int fd, const char *filename);
 
 #endif /* OBJECT_FILE_H */

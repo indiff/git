@@ -40,10 +40,17 @@ struct ref_transaction;
 #define REF_LOG_ONLY (1 << 7)
 
 /*
+ * The reference contains a peeled object ID. This is used when the
+ * new_oid is pointing to a tag object and the reference backend
+ * wants to also store the peeled value for optimized retrieval.
+ */
+#define REF_HAVE_PEELED (1 << 15)
+
+/*
  * Return the length of time to retry acquiring a loose reference lock
  * before giving up, in milliseconds:
  */
-long get_files_ref_lock_timeout_ms(void);
+long get_files_ref_lock_timeout_ms(struct repository *repo);
 
 /*
  * Return true iff refname is minimally safe. "Safe" here means that
@@ -93,6 +100,12 @@ struct ref_update {
 	struct object_id old_oid;
 
 	/*
+	 * If the new_oid points to a tag object, set this to the peeled
+	 * object ID for optimized retrieval without needed to hit the odb.
+	 */
+	struct object_id peeled;
+
+	/*
 	 * If set, point the reference to this value. This can also be
 	 * used to convert regular references to become symbolic refs.
 	 * Cannot be set together with `new_oid`.
@@ -128,6 +141,7 @@ struct ref_update {
 	 * was rejected.
 	 */
 	enum ref_transaction_error rejection_err;
+	const char *rejection_details;
 
 	/*
 	 * If this ref_update was split off of a symref update via
@@ -153,7 +167,8 @@ int refs_read_raw_ref(struct ref_store *ref_store, const char *refname,
  */
 int ref_transaction_maybe_set_rejected(struct ref_transaction *transaction,
 				       size_t update_idx,
-				       enum ref_transaction_error err);
+				       enum ref_transaction_error err,
+				       struct strbuf *details);
 
 /*
  * Add a ref_update with the specified properties to transaction, and
@@ -167,6 +182,7 @@ struct ref_update *ref_transaction_add_update(
 		const char *refname, unsigned int flags,
 		const struct object_id *new_oid,
 		const struct object_id *old_oid,
+		const struct object_id *peeled,
 		const char *new_target, const char *old_target,
 		const char *committer_info,
 		const char *msg);
@@ -384,13 +400,23 @@ struct ref_store;
 				 REF_STORE_MAIN)
 
 /*
+ * Options for initializing the ref backend. All backend-agnostic information
+ * which backends required will be held here.
+ */
+struct ref_store_init_options {
+	/* The kind of operations that the ref_store is allowed to perform. */
+	unsigned int access_flags;
+};
+
+/*
  * Initialize the ref_store for the specified gitdir. These functions
  * should call base_ref_store_init() to initialize the shared part of
  * the ref_store and to record the ref_store for later lookup.
  */
 typedef struct ref_store *ref_store_init_fn(struct repository *repo,
+					    const char *payload,
 					    const char *gitdir,
-					    unsigned int flags);
+					    const struct ref_store_init_options *opts);
 /*
  * Release all memory and resources associated with the ref store.
  */
@@ -417,10 +443,6 @@ typedef int ref_transaction_finish_fn(struct ref_store *refs,
 typedef int ref_transaction_abort_fn(struct ref_store *refs,
 				     struct ref_transaction *transaction,
 				     struct strbuf *err);
-
-typedef int ref_transaction_commit_fn(struct ref_store *refs,
-				      struct ref_transaction *transaction,
-				      struct strbuf *err);
 
 typedef int optimize_fn(struct ref_store *ref_store,
 			struct refs_optimize_opts *opts);
@@ -665,5 +687,18 @@ enum ref_transaction_error refs_verify_refnames_available(struct ref_store *refs
 					  struct ref_transaction *transaction,
 					  unsigned int initial_transaction,
 					  struct strbuf *err);
+
+/*
+ * Given a gitdir and the reference storage payload provided, retrieve the
+ * 'refdir' and 'ref_common_dir'. The former is where references should be
+ * stored for the current worktree, the latter is the common reference
+ * directory if working with a linked worktree. If working with the main
+ * worktree, both values will be the same.
+ *
+ * This is used by backends that store references in the repository directly.
+ */
+void refs_compute_filesystem_location(const char *gitdir, const char *payload,
+				      bool *is_worktree, struct strbuf *refdir,
+				      struct strbuf *ref_common_dir);
 
 #endif /* REFS_REFS_INTERNAL_H */

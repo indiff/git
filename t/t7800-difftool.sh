@@ -27,12 +27,11 @@ prompt_given ()
 }
 
 test_expect_success 'basic usage requires no repo' '
-	test_expect_code 129 git difftool -h >output &&
+	git difftool -h >output &&
 	test_grep ^usage: output &&
 	# create a ceiling directory to prevent Git from finding a repo
 	mkdir -p not/repo &&
 	test_when_finished rm -r not &&
-	test_expect_code 129 \
 	env GIT_CEILING_DIRECTORIES="$(pwd)/not" \
 	git -C not/repo difftool -h >output &&
 	test_grep ^usage: output
@@ -431,32 +430,32 @@ test_expect_success 'setup with 2 files different' '
 test_expect_success 'say no to the first file' '
 	(echo n && echo) >input &&
 	git difftool -x cat branch <input >output &&
-	grep m2 output &&
-	grep br2 output &&
-	! grep main output &&
-	! grep branch output
+	test_grep m2 output &&
+	test_grep br2 output &&
+	test_grep ! main output &&
+	test_grep ! branch output
 '
 
 test_expect_success 'say no to the second file' '
 	(echo && echo n) >input &&
 	git difftool -x cat branch <input >output &&
-	grep main output &&
-	grep branch output &&
-	! grep m2 output &&
-	! grep br2 output
+	test_grep main output &&
+	test_grep branch output &&
+	test_grep ! m2 output &&
+	test_grep ! br2 output
 '
 
 test_expect_success 'ending prompt input with EOF' '
 	git difftool -x cat branch </dev/null >output &&
-	! grep main output &&
-	! grep branch output &&
-	! grep m2 output &&
-	! grep br2 output
+	test_grep ! main output &&
+	test_grep ! branch output &&
+	test_grep ! m2 output &&
+	test_grep ! br2 output
 '
 
 test_expect_success 'difftool --tool-help' '
 	git difftool --tool-help >output &&
-	grep tool output
+	test_grep tool output
 '
 
 test_expect_success 'setup change in subdirectory' '
@@ -667,6 +666,15 @@ run_dir_diff_test 'difftool --dir-diff syncs worktree without unstaged change' '
 
 run_dir_diff_test 'difftool --dir-diff with no diff' '
 	git difftool -d main main
+'
+
+test_expect_success 'difftool --dir-diff errors out on an invalid path' '
+	blob=$(echo content | git hash-object -w --stdin) &&
+	tree=$(printf "100644 blob %s\t.git\n" "$blob" | git mktree) &&
+	commit=$(git commit-tree -m "tree with a .git entry" "$tree") &&
+	test_must_fail git difftool --dir-diff --no-symlinks \
+		--extcmd true "$commit" HEAD 2>err &&
+	test_grep "invalid path" err
 '
 
 write_script modify-file <<\EOF

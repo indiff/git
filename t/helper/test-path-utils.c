@@ -250,6 +250,7 @@ static int protect_ntfs_hfs_benchmark(int argc, const char **argv)
 	double m[3][2], v[3][2];
 	uint64_t cumul;
 	double cumul2;
+	int ntfs, hfs;
 
 	if (argc > 1 && !strcmp(argv[1], "--with-symlink-mode")) {
 		file_mode = 0120000;
@@ -276,8 +277,13 @@ static int protect_ntfs_hfs_benchmark(int argc, const char **argv)
 			names[i][--len] = (char)(' ' + (my_random() % ('\x7f' - ' ')));
 	}
 
-	for (protect_ntfs = 0; protect_ntfs < 2; protect_ntfs++)
-		for (protect_hfs = 0; protect_hfs < 2; protect_hfs++) {
+	if (!the_repository->gitdir)
+		the_repository->gitdir = xstrdup(".git");
+
+	for (ntfs = 0; ntfs < 2; ntfs++)
+		for (hfs = 0; hfs < 2; hfs++) {
+			repo_config_values(the_repository)->protect_ntfs = ntfs;
+			repo_config_values(the_repository)->protect_hfs = hfs;
 			cumul = 0;
 			cumul2 = 0;
 			for (i = 0; i < repetitions; i++) {
@@ -285,18 +291,18 @@ static int protect_ntfs_hfs_benchmark(int argc, const char **argv)
 				for (j = 0; j < nr; j++)
 					verify_path(names[j], file_mode);
 				end = getnanotime();
-				printf("protect_ntfs = %d, protect_hfs = %d: %lfms\n", protect_ntfs, protect_hfs, (end-begin) / (double)1e6);
+				printf("protect_ntfs = %d, protect_hfs = %d: %lfms\n", ntfs, hfs, (end-begin) / (double)1e6);
 				cumul += end - begin;
 				cumul2 += (end - begin) * (end - begin);
 			}
-			m[protect_ntfs][protect_hfs] = cumul / (double)repetitions;
-			v[protect_ntfs][protect_hfs] = my_sqrt(cumul2 / (double)repetitions - m[protect_ntfs][protect_hfs] * m[protect_ntfs][protect_hfs]);
-			printf("mean: %lfms, stddev: %lfms\n", m[protect_ntfs][protect_hfs] / (double)1e6, v[protect_ntfs][protect_hfs] / (double)1e6);
+			m[ntfs][hfs] = cumul / (double)repetitions;
+			v[ntfs][hfs] = my_sqrt(cumul2 / (double)repetitions - m[ntfs][hfs] * m[ntfs][hfs]);
+			printf("mean: %lfms, stddev: %lfms\n", m[ntfs][hfs] / (double)1e6, v[ntfs][hfs] / (double)1e6);
 		}
 
-	for (protect_ntfs = 0; protect_ntfs < 2; protect_ntfs++)
-		for (protect_hfs = 0; protect_hfs < 2; protect_hfs++)
-			printf("ntfs=%d/hfs=%d: %lf%% slower\n", protect_ntfs, protect_hfs, (m[protect_ntfs][protect_hfs] - m[0][0]) * 100 / m[0][0]);
+	for (ntfs = 0; ntfs < 2; ntfs++)
+		for (hfs = 0; hfs < 2; hfs++)
+			printf("ntfs=%d/hfs=%d: %lf%% slower\n", ntfs, hfs, (m[ntfs][hfs] - m[0][0]) * 100 / m[0][0]);
 
 	return 0;
 }
@@ -377,9 +383,9 @@ int cmd__path_utils(int argc, const char **argv)
 		const char *prefix = argv[2];
 		int prefix_len = strlen(prefix);
 		int nongit_ok;
-		setup_git_directory_gently(&nongit_ok);
+		setup_git_directory_gently(the_repository, &nongit_ok);
 		while (argc > 3) {
-			char *pfx = prefix_path(prefix, prefix_len, argv[3]);
+			char *pfx = prefix_path(the_repository, prefix, prefix_len, argv[3]);
 
 			puts(pfx);
 			free(pfx);
@@ -477,14 +483,20 @@ int cmd__path_utils(int argc, const char **argv)
 
 	if (argc > 5 && !strcmp(argv[1], "slice-tests")) {
 		int res = 0;
-		long offset, stride, i;
+		long slice, slices_total, i;
 		struct string_list list = STRING_LIST_INIT_NODUP;
 		struct stat st;
 
-		offset = strtol(argv[2], NULL, 10);
-		stride = strtol(argv[3], NULL, 10);
-		if (stride < 1)
-			stride = 1;
+		slices_total = strtol(argv[3], NULL, 10);
+		if (slices_total < 1)
+			die("there must be at least one slice, got '%s'",
+			    argv[3]);
+
+		slice = strtol(argv[2], NULL, 10);
+		if (1 > slice || slice > slices_total)
+			die("slice must be in the range 1 <= slice <= %ld, got '%s'",
+			    slices_total, argv[2]);
+
 		for (i = 4; i < argc; i++)
 			if (stat(argv[i], &st))
 				res = error_errno("Cannot stat '%s'", argv[i]);
@@ -492,7 +504,7 @@ int cmd__path_utils(int argc, const char **argv)
 				string_list_append(&list, argv[i])->util =
 					(void *)(intptr_t)st.st_size;
 		QSORT(list.items, list.nr, cmp_by_st_size);
-		for (i = offset; i < list.nr; i+= stride)
+		for (i = slice - 1; i < list.nr; i+= slices_total)
 			printf("%s\n", list.items[i].string);
 
 		return !!res;

@@ -238,7 +238,7 @@ static struct commit *fake_working_tree_commit(struct repository *r,
 		struct stat st;
 		const char *read_from;
 		char *buf_ptr;
-		unsigned long buf_len;
+		size_t buf_len;
 
 		if (contents_from) {
 			if (stat(contents_from, &st) < 0)
@@ -335,7 +335,7 @@ static const char *get_next_line(const char *start, const char *end)
 }
 
 static int find_line_starts(int **line_starts, const char *buf,
-			    unsigned long len)
+			    size_t len)
 {
 	const char *end = buf + len;
 	const char *p;
@@ -1034,7 +1034,7 @@ static void fill_origin_blob(struct diff_options *opt,
 {
 	if (!o->file.ptr) {
 		enum object_type type;
-		unsigned long file_size;
+		size_t file_size;
 
 		(*num_read_blob)++;
 		if (opt->flags.allow_textconv &&
@@ -2368,7 +2368,7 @@ static struct commit_list *first_scapegoat(struct rev_info *revs, struct commit 
 		if (revs->first_parent_only &&
 		    commit->parents &&
 		    commit->parents->next) {
-			free_commit_list(commit->parents->next);
+			commit_list_free(commit->parents->next);
 			commit->parents->next = NULL;
 		}
 		return commit->parents;
@@ -2813,7 +2813,7 @@ void setup_scoreboard(struct blame_scoreboard *sb,
 		}
 
 		if (!sb->contents_from)
-			setup_work_tree();
+			setup_work_tree(the_repository);
 
 		sb->final = fake_working_tree_commit(sb->repo,
 						     &sb->revs->diffopt,

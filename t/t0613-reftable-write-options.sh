@@ -68,8 +68,8 @@ test_expect_success 'many refs results in multiple blocks' '
 	(
 		cd repo &&
 		test_commit initial &&
-		test_seq -f "update refs/heads/branch-%d HEAD" 200 >input &&
-		git update-ref --stdin <input &&
+		test_seq -f "update refs/heads/branch-%d HEAD" 200 |
+		git update-ref --stdin &&
 		git pack-refs &&
 
 		cat >expect <<-EOF &&
@@ -178,8 +178,8 @@ test_expect_success 'restart interval at every single record' '
 	(
 		cd repo &&
 		test_commit initial &&
-		test_seq -f "update refs/heads/branch-%d HEAD" 10 >input &&
-		git update-ref --stdin <input &&
+		test_seq -f "update refs/heads/branch-%d HEAD" 10 |
+		git update-ref --stdin &&
 		git -c reftable.restartInterval=1 pack-refs &&
 
 		cat >expect <<-EOF &&
@@ -218,8 +218,8 @@ test_expect_success 'object index gets written by default with ref index' '
 	(
 		cd repo &&
 		test_commit initial &&
-		test_seq -f "update refs/heads/branch-%d HEAD" 5 >input &&
-		git update-ref --stdin <input &&
+		test_seq -f "update refs/heads/branch-%d HEAD" 5 |
+		git update-ref --stdin &&
 		git -c reftable.blockSize=100 pack-refs &&
 
 		cat >expect <<-EOF &&
@@ -253,8 +253,8 @@ test_expect_success 'object index can be disabled' '
 	(
 		cd repo &&
 		test_commit initial &&
-		test_seq -f "update refs/heads/branch-%d HEAD" 5 >input &&
-		git update-ref --stdin <input &&
+		test_seq -f "update refs/heads/branch-%d HEAD" 5 |
+		git update-ref --stdin &&
 		git -c reftable.blockSize=100 -c reftable.indexObjects=false pack-refs &&
 
 		cat >expect <<-EOF &&
@@ -275,6 +275,25 @@ test_expect_success 'object index can be disabled' '
 		EOF
 		test-tool dump-reftable -b .git/reftable/*.ref >actual &&
 		test_cmp expect actual
+	)
+'
+
+test_expect_success 'write options can be set up via onbranch condition' '
+	test_config_global core.logAllRefUpdates false &&
+	test_when_finished "rm -rf repo" &&
+	init_repo &&
+	(
+		cd repo &&
+		test_commit A &&
+		test_commit B &&
+		cat >.git/include <<-\EOF &&
+		[reftable]
+			blockSize = 123
+		EOF
+		git config includeIf.onbranch:master.path "$(pwd)/.git/include" &&
+		git refs optimize &&
+		test-tool dump-reftable -b .git/reftable/*.ref >stats &&
+		test_grep "block_size: 123" stats
 	)
 '
 

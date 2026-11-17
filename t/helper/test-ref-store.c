@@ -74,17 +74,9 @@ static const char **get_store(const char **argv, struct ref_store **refs)
 	} else if (!strcmp(argv[0], "main")) {
 		*refs = get_main_ref_store(the_repository);
 	} else if (skip_prefix(argv[0], "submodule:", &gitdir)) {
-		struct strbuf sb = STRBUF_INIT;
-
-		if (!repo_submodule_path_append(the_repository,
-						&sb, gitdir, "objects/"))
-			die("computing submodule path failed");
-		odb_add_to_alternates_memory(the_repository->objects, sb.buf);
-		strbuf_release(&sb);
-
 		*refs = repo_get_submodule_ref_store(the_repository, gitdir);
 	} else if (skip_prefix(argv[0], "worktree:", &gitdir)) {
-		struct worktree **p, **worktrees = get_worktrees();
+		struct worktree **p, **worktrees = get_worktrees(the_repository);
 
 		for (p = worktrees; *p; p++) {
 			struct worktree *wt = *p;
@@ -163,17 +155,22 @@ static int each_ref(const struct reference *ref, void *cb_data UNUSED)
 static int cmd_for_each_ref(struct ref_store *refs, const char **argv)
 {
 	const char *prefix = notnull(*argv++, "prefix");
-
-	return refs_for_each_ref_in(refs, prefix, each_ref, NULL);
+	struct refs_for_each_ref_options opts = {
+		.prefix = prefix,
+		.trim_prefix = strlen(prefix),
+	};
+	return refs_for_each_ref_ext(refs, each_ref, NULL, &opts);
 }
 
 static int cmd_for_each_ref__exclude(struct ref_store *refs, const char **argv)
 {
 	const char *prefix = notnull(*argv++, "prefix");
-	const char **exclude_patterns = argv;
+	struct refs_for_each_ref_options opts = {
+		.prefix = prefix,
+		.exclude_patterns = argv,
+	};
 
-	return refs_for_each_fullref_in(refs, prefix, exclude_patterns, each_ref,
-					NULL);
+	return refs_for_each_ref_ext(refs, each_ref, NULL, &opts);
 }
 
 static int cmd_resolve_ref(struct ref_store *refs, const char **argv)
@@ -335,7 +332,7 @@ int cmd__ref_store(int argc UNUSED, const char **argv)
 	const char *func;
 	struct command *cmd;
 
-	setup_git_directory();
+	setup_git_directory(the_repository);
 
 	argv = get_store(argv + 1, &refs);
 

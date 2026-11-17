@@ -21,6 +21,7 @@
 #include "gettext.h"
 #include "git-zlib.h"
 #include "ident.h"
+#include "lockfile.h"
 #include "mailmap.h"
 #include "object-name.h"
 #include "repository.h"
@@ -40,56 +41,31 @@
 static int pack_compression_seen;
 static int zlib_compression_seen;
 
-int trust_executable_bit = 1;
-int trust_ctime = 1;
-int check_stat = 1;
-int has_symlinks = 1;
 int minimum_abbrev = 4, default_abbrev = -1;
-int ignore_case;
 int assume_unchanged;
-int is_bare_repository_cfg = -1; /* unspecified */
-int warn_on_object_refname_ambiguity = 1;
 char *git_commit_encoding;
 char *git_log_output_encoding;
-char *apply_default_whitespace;
-char *apply_default_ignorewhitespace;
-char *git_attributes_file;
-int zlib_compression_level = Z_BEST_SPEED;
-int pack_compression_level = Z_DEFAULT_COMPRESSION;
 int fsync_object_files = -1;
 int use_fsync = -1;
 enum fsync_method fsync_method = FSYNC_METHOD_DEFAULT;
 enum fsync_component fsync_components = FSYNC_COMPONENTS_DEFAULT;
-char *editor_program;
-char *askpass_program;
-char *excludes_file;
 enum auto_crlf auto_crlf = AUTO_CRLF_FALSE;
 enum eol core_eol = EOL_UNSET;
 int global_conv_flags_eol = CONV_EOL_RNDTRP_WARN;
 char *check_roundtrip_encoding;
-enum branch_track git_branch_track = BRANCH_TRACK_REMOTE;
-enum rebase_setup_type autorebase = AUTOREBASE_NEVER;
-enum push_default_type push_default = PUSH_DEFAULT_UNSPECIFIED;
 #ifndef OBJECT_CREATION_MODE
 #define OBJECT_CREATION_MODE OBJECT_CREATION_USES_HARDLINKS
 #endif
-enum object_creation_mode object_creation_mode = OBJECT_CREATION_MODE;
 int grafts_keep_true_parents;
-int core_apply_sparse_checkout;
-int core_sparse_checkout_cone;
-int sparse_expect_files_outside_of_patterns;
-int precomposed_unicode = -1; /* see probe_utf8_pathname_composition() */
 unsigned long pack_size_limit_cfg;
 
 #ifndef PROTECT_HFS_DEFAULT
 #define PROTECT_HFS_DEFAULT 0
 #endif
-int protect_hfs = PROTECT_HFS_DEFAULT;
 
 #ifndef PROTECT_NTFS_DEFAULT
 #define PROTECT_NTFS_DEFAULT 1
 #endif
-int protect_ntfs = PROTECT_NTFS_DEFAULT;
 
 /*
  * The character that begins a commented line in user-editable file
@@ -101,9 +77,6 @@ char *comment_line_str_to_free;
 int auto_comment_line_char;
 bool warn_on_auto_comment_char;
 #endif /* !WITH_BREAKING_CHANGES */
-
-/* This is set by setup_git_directory_gently() and/or git_default_config() */
-char *git_work_tree_cfg;
 
 /*
  * Repository-local GIT_* environment variables; see environment.h for details.
@@ -138,10 +111,55 @@ const char *getenv_safe(struct strvec *argv, const char *name)
 	return argv->v[argv->nr - 1];
 }
 
-int is_bare_repository(void)
+int is_bare_repository(struct repository *repo)
 {
 	/* if core.bare is not 'false', let's see if there is a work tree */
-	return is_bare_repository_cfg && !repo_get_work_tree(the_repository);
+	return repo->bare_cfg && !repo_get_work_tree(repo);
+}
+
+int repo_protect_ntfs(struct repository *repo)
+{
+	return (repo && repo->initialized) ?
+		repo_config_values(repo)->protect_ntfs :
+		PROTECT_NTFS_DEFAULT;
+}
+
+int repo_protect_hfs(struct repository *repo)
+{
+	return (repo && repo->initialized) ?
+		repo_config_values(repo)->protect_hfs :
+		PROTECT_HFS_DEFAULT;
+}
+
+int repo_ignore_case(struct repository *repo)
+{
+	return (repo && repo->initialized) ?
+		repo_config_values(repo)->ignore_case :
+		0;
+}
+
+int repo_trust_executable_bit(struct repository *repo)
+{
+	return repo->initialized
+		? repo_config_values(repo)->trust_executable_bit
+		: 1;
+}
+
+int repo_has_symlinks(struct repository *repo)
+{
+	return repo->initialized
+		? repo_config_values(repo)->has_symlinks
+		: platform_has_symlinks();
+}
+
+const char *repo_excludes_file(struct repository *repo)
+{
+	struct repo_config_values *cfg = repo_config_values(repo);
+
+	if (!cfg->excludes_file)
+		cfg->excludes_file = xdg_config_home("ignore");
+
+	return cfg->excludes_file;
 }
 
 int have_git_dir(void)
@@ -303,22 +321,24 @@ next_name:
 int git_default_core_config(const char *var, const char *value,
 			    const struct config_context *ctx, void *cb)
 {
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
 	/* This needs a better name */
 	if (!strcmp(var, "core.filemode")) {
-		trust_executable_bit = git_config_bool(var, value);
+		cfg->trust_executable_bit = git_config_bool(var, value);
 		return 0;
 	}
 	if (!strcmp(var, "core.trustctime")) {
-		trust_ctime = git_config_bool(var, value);
+		cfg->trust_ctime = git_config_bool(var, value);
 		return 0;
 	}
 	if (!strcmp(var, "core.checkstat")) {
 		if (!value)
 			return config_error_nonbool(var);
 		if (!strcasecmp(value, "default"))
-			check_stat = 1;
+			cfg->check_stat = 1;
 		else if (!strcasecmp(value, "minimal"))
-			check_stat = 0;
+			cfg->check_stat = 0;
 		else
 			return error(_("invalid value for '%s': '%s'"),
 				     var, value);
@@ -330,22 +350,23 @@ int git_default_core_config(const char *var, const char *value,
 	}
 
 	if (!strcmp(var, "core.symlinks")) {
-		has_symlinks = git_config_bool(var, value);
+		struct repo_config_values *cfg = repo_config_values(the_repository);
+		cfg->has_symlinks = git_config_bool(var, value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.ignorecase")) {
-		ignore_case = git_config_bool(var, value);
+		cfg->ignore_case = git_config_bool(var, value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.attributesfile")) {
-		FREE_AND_NULL(git_attributes_file);
-		return git_config_pathname(&git_attributes_file, var, value);
+		FREE_AND_NULL(cfg->attributes_file);
+		return git_config_pathname(&cfg->attributes_file, var, value);
 	}
 
 	if (!strcmp(var, "core.bare")) {
-		is_bare_repository_cfg = git_config_bool(var, value);
+		the_repository->bare_cfg = git_config_bool(var, value);
 		return 0;
 	}
 
@@ -379,7 +400,7 @@ int git_default_core_config(const char *var, const char *value,
 			level = Z_DEFAULT_COMPRESSION;
 		else if (level < 0 || level > Z_BEST_COMPRESSION)
 			die(_("bad zlib compression level %d"), level);
-		zlib_compression_level = level;
+		cfg->zlib_compression_level = level;
 		zlib_compression_seen = 1;
 		return 0;
 	}
@@ -391,9 +412,9 @@ int git_default_core_config(const char *var, const char *value,
 		else if (level < 0 || level > Z_BEST_COMPRESSION)
 			die(_("bad zlib compression level %d"), level);
 		if (!zlib_compression_seen)
-			zlib_compression_level = level;
+			cfg->zlib_compression_level = level;
 		if (!pack_compression_seen)
-			pack_compression_level = level;
+			cfg->pack_compression_level = level;
 		return 0;
 	}
 
@@ -436,8 +457,8 @@ int git_default_core_config(const char *var, const char *value,
 	}
 
 	if (!strcmp(var, "core.editor")) {
-		FREE_AND_NULL(editor_program);
-		return git_config_string(&editor_program, var, value);
+		FREE_AND_NULL(cfg->editor_program);
+		return git_config_string(&cfg->editor_program, var, value);
 	}
 
 	if (!strcmp(var, "core.commentchar") ||
@@ -464,13 +485,13 @@ int git_default_core_config(const char *var, const char *value,
 	}
 
 	if (!strcmp(var, "core.askpass")) {
-		FREE_AND_NULL(askpass_program);
-		return git_config_string(&askpass_program, var, value);
+		FREE_AND_NULL(cfg->askpass_program);
+		return git_config_string(&cfg->askpass_program, var, value);
 	}
 
 	if (!strcmp(var, "core.excludesfile")) {
-		FREE_AND_NULL(excludes_file);
-		return git_config_pathname(&excludes_file, var, value);
+		FREE_AND_NULL(cfg->excludes_file);
+		return git_config_pathname(&cfg->excludes_file, var, value);
 	}
 
 	if (!strcmp(var, "core.whitespace")) {
@@ -508,40 +529,45 @@ int git_default_core_config(const char *var, const char *value,
 		return 0;
 	}
 
+	if (!strcmp(var, "core.lockfilepid")) {
+		lockfile_pid_enabled = git_config_bool(var, value);
+		return 0;
+	}
+
 	if (!strcmp(var, "core.createobject")) {
 		if (!value)
 			return config_error_nonbool(var);
 		if (!strcmp(value, "rename"))
-			object_creation_mode = OBJECT_CREATION_USES_RENAMES;
+			cfg->object_creation_mode = OBJECT_CREATION_USES_RENAMES;
 		else if (!strcmp(value, "link"))
-			object_creation_mode = OBJECT_CREATION_USES_HARDLINKS;
+			cfg->object_creation_mode = OBJECT_CREATION_USES_HARDLINKS;
 		else
 			die(_("invalid mode for object creation: %s"), value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.sparsecheckout")) {
-		core_apply_sparse_checkout = git_config_bool(var, value);
+		cfg->apply_sparse_checkout = git_config_bool(var, value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.sparsecheckoutcone")) {
-		core_sparse_checkout_cone = git_config_bool(var, value);
+		cfg->core_sparse_checkout_cone = git_config_bool(var, value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.precomposeunicode")) {
-		precomposed_unicode = git_config_bool(var, value);
+		cfg->precomposed_unicode = git_config_bool(var, value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.protecthfs")) {
-		protect_hfs = git_config_bool(var, value);
+		cfg->protect_hfs = git_config_bool(var, value);
 		return 0;
 	}
 
 	if (!strcmp(var, "core.protectntfs")) {
-		protect_ntfs = git_config_bool(var, value);
+		cfg->protect_ntfs = git_config_bool(var, value);
 		return 0;
 	}
 
@@ -551,8 +577,10 @@ int git_default_core_config(const char *var, const char *value,
 
 static int git_default_sparse_config(const char *var, const char *value)
 {
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
 	if (!strcmp(var, "sparse.expectfilesoutsideofpatterns")) {
-		sparse_expect_files_outside_of_patterns = git_config_bool(var, value);
+		cfg->sparse_expect_files_outside_of_patterns = git_config_bool(var, value);
 		return 0;
 	}
 
@@ -578,31 +606,33 @@ static int git_default_i18n_config(const char *var, const char *value)
 
 static int git_default_branch_config(const char *var, const char *value)
 {
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
 	if (!strcmp(var, "branch.autosetupmerge")) {
 		if (value && !strcmp(value, "always")) {
-			git_branch_track = BRANCH_TRACK_ALWAYS;
+			cfg->branch_track = BRANCH_TRACK_ALWAYS;
 			return 0;
 		} else if (value && !strcmp(value, "inherit")) {
-			git_branch_track = BRANCH_TRACK_INHERIT;
+			cfg->branch_track = BRANCH_TRACK_INHERIT;
 			return 0;
 		} else if (value && !strcmp(value, "simple")) {
-			git_branch_track = BRANCH_TRACK_SIMPLE;
+			cfg->branch_track = BRANCH_TRACK_SIMPLE;
 			return 0;
 		}
-		git_branch_track = git_config_bool(var, value);
+		cfg->branch_track = git_config_bool(var, value);
 		return 0;
 	}
 	if (!strcmp(var, "branch.autosetuprebase")) {
 		if (!value)
 			return config_error_nonbool(var);
 		else if (!strcmp(value, "never"))
-			autorebase = AUTOREBASE_NEVER;
+			cfg->autorebase = AUTOREBASE_NEVER;
 		else if (!strcmp(value, "local"))
-			autorebase = AUTOREBASE_LOCAL;
+			cfg->autorebase = AUTOREBASE_LOCAL;
 		else if (!strcmp(value, "remote"))
-			autorebase = AUTOREBASE_REMOTE;
+			cfg->autorebase = AUTOREBASE_REMOTE;
 		else if (!strcmp(value, "always"))
-			autorebase = AUTOREBASE_ALWAYS;
+			cfg->autorebase = AUTOREBASE_ALWAYS;
 		else
 			return error(_("malformed value for %s"), var);
 		return 0;
@@ -614,43 +644,29 @@ static int git_default_branch_config(const char *var, const char *value)
 
 static int git_default_push_config(const char *var, const char *value)
 {
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
 	if (!strcmp(var, "push.default")) {
 		if (!value)
 			return config_error_nonbool(var);
 		else if (!strcmp(value, "nothing"))
-			push_default = PUSH_DEFAULT_NOTHING;
+			cfg->push_default = PUSH_DEFAULT_NOTHING;
 		else if (!strcmp(value, "matching"))
-			push_default = PUSH_DEFAULT_MATCHING;
+			cfg->push_default = PUSH_DEFAULT_MATCHING;
 		else if (!strcmp(value, "simple"))
-			push_default = PUSH_DEFAULT_SIMPLE;
+			cfg->push_default = PUSH_DEFAULT_SIMPLE;
 		else if (!strcmp(value, "upstream"))
-			push_default = PUSH_DEFAULT_UPSTREAM;
+			cfg->push_default = PUSH_DEFAULT_UPSTREAM;
 		else if (!strcmp(value, "tracking")) /* deprecated */
-			push_default = PUSH_DEFAULT_UPSTREAM;
+			cfg->push_default = PUSH_DEFAULT_UPSTREAM;
 		else if (!strcmp(value, "current"))
-			push_default = PUSH_DEFAULT_CURRENT;
+			cfg->push_default = PUSH_DEFAULT_CURRENT;
 		else {
 			error(_("malformed value for %s: %s"), var, value);
 			return error(_("must be one of nothing, matching, simple, "
 				       "upstream or current"));
 		}
 		return 0;
-	}
-
-	/* Add other config variables here and to Documentation/config.adoc. */
-	return 0;
-}
-
-static int git_default_mailmap_config(const char *var, const char *value)
-{
-	if (!strcmp(var, "mailmap.file")) {
-		FREE_AND_NULL(git_mailmap_file);
-		return git_config_pathname(&git_mailmap_file, var, value);
-	}
-
-	if (!strcmp(var, "mailmap.blob")) {
-		FREE_AND_NULL(git_mailmap_blob);
-		return git_config_string(&git_mailmap_blob, var, value);
 	}
 
 	/* Add other config variables here and to Documentation/config.adoc. */
@@ -674,6 +690,8 @@ static int git_default_attr_config(const char *var, const char *value)
 int git_default_config(const char *var, const char *value,
 		       const struct config_context *ctx, void *cb)
 {
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+
 	if (starts_with(var, "core."))
 		return git_default_core_config(var, value, ctx, cb);
 
@@ -690,9 +708,6 @@ int git_default_config(const char *var, const char *value,
 
 	if (starts_with(var, "push."))
 		return git_default_push_config(var, value);
-
-	if (starts_with(var, "mailmap."))
-		return git_default_mailmap_config(var, value);
 
 	if (starts_with(var, "attr."))
 		return git_default_attr_config(var, value);
@@ -716,7 +731,7 @@ int git_default_config(const char *var, const char *value,
 			level = Z_DEFAULT_COMPRESSION;
 		else if (level < 0 || level > Z_BEST_COMPRESSION)
 			die(_("bad pack compression level %d"), level);
-		pack_compression_level = level;
+		cfg->pack_compression_level = level;
 		pack_compression_seen = 1;
 		return 0;
 	}
@@ -724,6 +739,57 @@ int git_default_config(const char *var, const char *value,
 	if (starts_with(var, "sparse."))
 		return git_default_sparse_config(var, value);
 
+	if (!strcmp(var, "index.maxpathlen")) {
+		unsigned long maxlen = git_config_ulong(var, value, ctx->kvi);
+
+		if (maxlen > INT_MAX)
+			return error(_("value for '%s' exceeds maximum of %d"),
+				     var, INT_MAX);
+		cfg->max_ce_namelen = maxlen;
+		return 0;
+	}
+
 	/* Add other config variables here and to Documentation/config.adoc. */
 	return 0;
+}
+
+void repo_config_values_init(struct repo_config_values *cfg)
+{
+	cfg->attributes_file = NULL;
+	cfg->excludes_file = NULL;
+	cfg->editor_program = NULL;
+	cfg->pager_program = NULL;
+	cfg->askpass_program = NULL;
+	cfg->apply_default_whitespace = NULL;
+	cfg->apply_default_ignorewhitespace = NULL;
+	cfg->push_default = PUSH_DEFAULT_UNSPECIFIED;
+	cfg->autorebase = AUTOREBASE_NEVER;
+	cfg->object_creation_mode = OBJECT_CREATION_MODE;
+	cfg->apply_sparse_checkout = 0;
+	cfg->protect_hfs = PROTECT_HFS_DEFAULT;
+	cfg->protect_ntfs = PROTECT_NTFS_DEFAULT;
+	cfg->ignore_case = 0;
+	cfg->trust_executable_bit = 1;
+	cfg->has_symlinks = platform_has_symlinks();
+	cfg->max_ce_namelen = INT_MAX / 2 - 1024;
+	cfg->branch_track = BRANCH_TRACK_REMOTE;
+	cfg->trust_ctime = 1;
+	cfg->check_stat = 1;
+	cfg->zlib_compression_level = Z_BEST_SPEED;
+	cfg->pack_compression_level = Z_DEFAULT_COMPRESSION;
+	cfg->precomposed_unicode = -1; /* see probe_utf8_pathname_composition() */
+	cfg->core_sparse_checkout_cone = 0;
+	cfg->sparse_expect_files_outside_of_patterns = 0;
+	cfg->warn_on_object_refname_ambiguity = 1;
+}
+
+void repo_config_values_clear(struct repo_config_values *cfg)
+{
+	FREE_AND_NULL(cfg->attributes_file);
+	FREE_AND_NULL(cfg->excludes_file);
+	FREE_AND_NULL(cfg->editor_program);
+	FREE_AND_NULL(cfg->pager_program);
+	FREE_AND_NULL(cfg->askpass_program);
+	FREE_AND_NULL(cfg->apply_default_whitespace);
+	FREE_AND_NULL(cfg->apply_default_ignorewhitespace);
 }

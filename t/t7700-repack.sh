@@ -177,7 +177,7 @@ test_expect_success 'packed unreachable obs in alternate ODB are not loosened' '
 	rm -f .git/objects/pack/* &&
 	mv pack-* .git/objects/pack/ &&
 	git verify-pack -v -- .git/objects/pack/*.idx >packlist &&
-	! grep "^$coid " packlist &&
+	test_grep ! "^$coid " packlist &&
 	echo >.git/objects/info/alternates &&
 	test_must_fail git show $coid
 '
@@ -194,7 +194,7 @@ test_expect_success 'local packed unreachable obs that exist in alternate ODB ar
 	rm -f .git/objects/pack/* &&
 	mv pack-* .git/objects/pack/ &&
 	git verify-pack -v -- .git/objects/pack/*.idx >packlist &&
-	! grep "^$coid " &&
+	test_grep ! "^$coid " packlist &&
 	echo >.git/objects/info/alternates &&
 	test_must_fail git show $coid
 '
@@ -217,6 +217,7 @@ test_expect_success 'repack --keep-pack' '
 		cd keep-pack &&
 		# avoid producing different packs due to delta/base choices
 		git config pack.window 0 &&
+		git config maintenance.auto false &&
 		P1=$(commit_and_pack 1) &&
 		P2=$(commit_and_pack 2) &&
 		P3=$(commit_and_pack 3) &&
@@ -225,8 +226,8 @@ test_expect_success 'repack --keep-pack' '
 		test_line_count = 4 old-counts &&
 		git repack -a -d --keep-pack $P1 --keep-pack $P4 &&
 		ls .git/objects/pack/*.pack >new-counts &&
-		grep -q $P1 new-counts &&
-		grep -q $P4 new-counts &&
+		test_grep -q $P1 new-counts &&
+		test_grep -q $P4 new-counts &&
 		test_line_count = 3 new-counts &&
 		git fsck &&
 
@@ -260,6 +261,7 @@ test_expect_success 'repacking fails when missing .pack actually means missing o
 
 		# Avoid producing different packs due to delta/base choices
 		git config pack.window 0 &&
+		git config maintenance.auto false &&
 		P1=$(commit_and_pack 1) &&
 		P2=$(commit_and_pack 2) &&
 		P3=$(commit_and_pack 3) &&
@@ -274,7 +276,7 @@ test_expect_success 'repacking fails when missing .pack actually means missing o
 
 		test_must_fail git fsck &&
 		test_must_fail env GIT_COMMIT_GRAPH_PARANOIA=true git repack --cruft -d 2>err &&
-		grep "bad object" err &&
+		test_grep "bad object" err &&
 
 		# Before failing, the repack did not modify the
 		# pack directory.
@@ -319,7 +321,7 @@ test_expect_success 'no bitmaps created if .keep files present' '
 
 test_expect_success 'auto-bitmaps do not complain if unavailable' '
 	test_config -C bare.git pack.packSizeLimit 1M &&
-	blob=$(test-tool genrandom big $((1024*1024)) |
+	blob=$(test-tool genrandom big 1m |
 	       git -C bare.git hash-object -w --stdin) &&
 	git -C bare.git update-ref refs/tags/big $blob &&
 
@@ -458,8 +460,8 @@ test_expect_success '--filter works with --pack-kept-objects and .keep packs' '
 
 		# Object bar is in both the old .keep pack and the new
 		# pack that contained the filtered out objects
-		grep "$bar_pack" bar_pack_1 &&
-		grep "$foo_pack_1" bar_pack_1 &&
+		test_grep "$bar_pack" bar_pack_1 &&
+		test_grep "$foo_pack_1" bar_pack_1 &&
 		test "$foo_pack_1" != "$head_pack_1"
 	)
 '
@@ -495,9 +497,9 @@ test_expect_success '--filter works with --max-pack-size' '
 		cd max-pack-size &&
 		test_commit base &&
 		# two blobs which exceed the maximum pack size
-		test-tool genrandom foo 1048576 >foo &&
+		test-tool genrandom foo 1m >foo &&
 		git hash-object -w foo &&
-		test-tool genrandom bar 1048576 >bar &&
+		test-tool genrandom bar 1m >bar &&
 		git hash-object -w bar &&
 		git add foo bar &&
 		git commit -m "adding foo and bar"
@@ -534,6 +536,7 @@ test_expect_success 'setup for --write-midx tests' '
 	(
 		cd midx &&
 		git config core.multiPackIndex true &&
+		git config maintenance.auto false &&
 
 		test_commit base
 	)

@@ -90,6 +90,32 @@ test_expect_success "new incomplete line in post-image" '
 	git -c core.whitespace=incomplete diff -R --check x
 '
 
+test_expect_success SYMLINKS "incomplete-line error is disabled for symlinks" '
+	test_when_finished "git reset --hard" &&
+	test_when_finished "rm -f mylink" &&
+
+	# a regular file with an incomplete line
+	printf "%s" one >mylink &&
+	git add mylink &&
+
+	# a symbolic link
+	rm mylink &&
+	ln -s two mylink &&
+
+	git -c diff.color=always -c core.whitespace=incomplete \
+		diff mylink >forward.raw &&
+	test_decode_color >forward <forward.raw &&
+	test_grep ! "<BRED>\\\\ No newline at end of file<RESET>" forward &&
+
+	git -c diff.color=always -c core.whitespace=incomplete \
+		diff -R mylink >reverse.raw &&
+	test_decode_color >reverse <reverse.raw &&
+	test_grep "<BRED>\\\\ No newline at end of file<RESET>" reverse &&
+
+	git -c core.whitespace=incomplete diff --check mylink &&
+	test_must_fail git -c core.whitespace=incomplete diff --check -R mylink
+'
+
 test_expect_success "Ray Lehtiniemi's example" '
 	cat <<-\EOF >x &&
 	do {
@@ -612,14 +638,14 @@ test_expect_success 'check mixed spaces and tabs in indent' '
 	# This is indented with SP HT SP.
 	echo " 	 foo();" >x &&
 	test_must_fail git diff --check >check &&
-	grep "space before tab in indent" check
+	test_grep "space before tab in indent" check
 '
 
 test_expect_success 'check mixed tabs and spaces in indent' '
 	# This is indented with HT SP HT.
 	echo "	 	foo();" >x &&
 	test_must_fail git diff --check >check &&
-	grep "space before tab in indent" check
+	test_grep "space before tab in indent" check
 '
 
 test_expect_success 'check with no whitespace errors' '
@@ -865,14 +891,14 @@ test_expect_success 'line numbers in --check output are correct' '
 	echo "" >x &&
 	echo "foo(); " >>x &&
 	test_must_fail git diff --check >check &&
-	grep "x:2:" check
+	test_grep "x:2:" check
 '
 
 test_expect_success 'checkdiff detects new trailing blank lines (1)' '
 	echo "foo();" >x &&
 	echo "" >>x &&
 	test_must_fail git diff --check >check &&
-	grep "new blank line" check
+	test_grep "new blank line" check
 '
 
 test_expect_success 'checkdiff detects new trailing blank lines (2)' '
@@ -880,7 +906,7 @@ test_expect_success 'checkdiff detects new trailing blank lines (2)' '
 	git add x &&
 	test_write_lines a "" "" "" "" >x &&
 	test_must_fail git diff --check >check &&
-	grep "new blank line" check
+	test_grep "new blank line" check
 '
 
 test_expect_success 'checkdiff allows new blank lines' '
@@ -992,7 +1018,7 @@ test_expect_success 'combined diff with autocrlf conversion' '
 
 	git diff >actual.raw &&
 	sed -e "1,/^@@@/d" actual.raw >actual &&
-	! grep "^-" actual
+	test_grep ! "^-" actual
 
 '
 
@@ -2140,8 +2166,8 @@ test_expect_success 'move detection with submodules' '
 
 	# no move detection as the moved line is across repository boundaries.
 	test_decode_color <actual >decoded_actual &&
-	! grep BGREEN decoded_actual &&
-	! grep BRED decoded_actual &&
+	test_grep ! BGREEN decoded_actual &&
+	test_grep ! BRED decoded_actual &&
 
 	# nor did we mess with it another way
 	git diff --submodule=diff --color >expect.raw &&

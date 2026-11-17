@@ -66,13 +66,11 @@ const char *repo_git_path_replace(struct repository *repo,
 
 /*
  * Similar to repo_git_path() but can produce paths for a specified
- * worktree instead of current one. When no worktree is given, then the path is
- * computed relative to main worktree of the given repository.
+ * worktree instead of current one.
  */
-const char *worktree_git_path(struct repository *r,
-			      const struct worktree *wt,
+const char *worktree_git_path(const struct worktree *wt,
 			      const char *fmt, ...)
-	__attribute__((format (printf, 3, 4)));
+	__attribute__((format (printf, 2, 3)));
 
 /*
  * The `repo_worktree_path` family of functions will construct a path into a
@@ -113,6 +111,12 @@ const char *repo_submodule_path_replace(struct repository *repo,
 					const char *path,
 					const char *fmt, ...)
 	__attribute__((format (printf, 4, 5)));
+
+/*
+ * Given a directory name 'dir' (not ending with a trailing '/'),
+ * determine if 'buf' is equal to 'dir' or has prefix 'dir'+'/'.
+ */
+int dir_prefix(const char *buf, const char *dir);
 
 void report_linked_checkout_garbage(struct repository *r);
 
@@ -214,7 +218,7 @@ void safe_create_dir(struct repository *repo, const char *dir, int share);
  *
  *   - It always adjusts shared permissions.
  *
- * Returns a negative erorr code on error, 0 on success.
+ * Returns a negative error code on error, 0 on success.
  */
 int safe_create_dir_in_gitdir(struct repository *repo, const char *path);
 
@@ -258,6 +262,36 @@ enum scld_error safe_create_leading_directories_no_share(char *path);
  */
 int safe_create_file_with_leading_directories(struct repository *repo,
 					      const char *path);
+
+/**
+ * The formatting strategy to apply when writing a path into a buffer.
+ */
+enum path_format {
+	/* Output the path exactly as-is without any modifications. */
+	PATH_FORMAT_UNMODIFIED,
+
+	/* Output a path relative to the provided directory prefix. */
+	PATH_FORMAT_RELATIVE,
+
+	/* Output a relative path only if the path shares a root with the prefix. */
+	PATH_FORMAT_RELATIVE_IF_SHARED,
+
+	/* Output a fully resolved, absolute canonical path. */
+	PATH_FORMAT_CANONICAL
+};
+
+/**
+ * Format a path according to the specified formatting strategy and store
+ * the result in the given strbuf, replacing any existing contents.
+ *
+ * `dest`   : The string buffer to store the formatted path into.
+ * `path`   : The path string that needs to be formatted.
+ * `prefix` : The directory prefix to calculate relative offsets against.
+ * Pass NULL to default to the current working directory where applicable.
+ * `format` : The formatting behavior rule to execute.
+ */
+void format_path(struct strbuf *dest, const char *path,
+		 const char *prefix, enum path_format format);
 
 # ifdef USE_THE_REPOSITORY_VARIABLE
 #  include "strbuf.h"

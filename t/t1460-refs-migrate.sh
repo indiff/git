@@ -212,7 +212,7 @@ do
 			test_commit -C repo initial &&
 			git -C repo refs migrate --dry-run \
 				--ref-format=$to_format >output &&
-			grep "Finished dry-run migration of refs" output &&
+			test_grep "Finished dry-run migration of refs" output &&
 			test_path_is_dir repo/.git/ref_migration.* &&
 			echo $from_format >expect &&
 			git -C repo rev-parse --show-ref-format >actual &&
@@ -276,11 +276,11 @@ test_expect_success 'multiple reftable blocks with multiple entries' '
 	test_when_finished "rm -rf repo" &&
 	git init --ref-format=files repo &&
 	test_commit -C repo first &&
-	printf "create refs/heads/ref-%d HEAD\n" $(test_seq 5000) >stdin &&
-	git -C repo update-ref --stdin <stdin &&
+	test_seq -f "create refs/heads/ref-%d HEAD" 5000 |
+	git -C repo update-ref --stdin &&
 	test_commit -C repo second &&
-	printf "update refs/heads/ref-%d HEAD\n" $(test_seq 3000) >stdin &&
-	git -C repo update-ref --stdin <stdin &&
+	test_seq -f "update refs/heads/ref-%d HEAD" 3000 |
+	git -C repo update-ref --stdin &&
 	test_migration repo reftable true
 '
 

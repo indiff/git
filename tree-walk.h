@@ -85,10 +85,10 @@ int update_tree_entry_gently(struct tree_desc *);
  * members of `struct tree`.
  */
 void init_tree_desc(struct tree_desc *desc, const struct object_id *tree_oid,
-		    const void *buf, unsigned long size);
+		    const void *buf, size_t size);
 
 int init_tree_desc_gently(struct tree_desc *desc, const struct object_id *oid,
-			  const void *buf, unsigned long size,
+			  const void *buf, size_t size,
 			  enum tree_desc_flags flags);
 
 /*
@@ -177,7 +177,7 @@ struct traverse_info {
 
 /**
  * Walk trees starting with "tree_oid" to find the entry for "name", and
- * return the the object name and the mode of the found entry via the
+ * return the object name and the mode of the found entry via the
  * "oid" and "mode" parameters.  Return 0 if the entry is found, and -1
  * otherwise.
  */

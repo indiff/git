@@ -49,10 +49,23 @@ static void create_directories(const char *path, int path_len,
 		 */
 		if (mkdir(buf, 0777)) {
 			if (errno == EEXIST && state->force &&
-			    !unlink_or_warn(buf) && !mkdir(buf, 0777))
+			    !unlink_or_warn(buf) && !mkdir(buf, 0777)) {
+				flush_fscache();
 				continue;
+			}
 			die_errno("cannot create directory at '%s'", buf);
 		}
+
+		/*
+		 * Flush the lstat cache of directory listings so that
+		 * subsequent has_dirs_only_path() calls see the
+		 * just-created directory. Without this, the Windows
+		 * fscache returns stale ENOENT for the new directory,
+		 * causing the next entry sharing this parent to
+		 * incorrectly hit the mkdir/unlink recovery path
+		 * above, which then fails with "Directory not empty".
+		 */
+		flush_fscache();
 	}
 	free(buf);
 }
@@ -92,11 +105,9 @@ static int create_file(const char *path, unsigned int mode)
 void *read_blob_entry(const struct cache_entry *ce, size_t *size)
 {
 	enum object_type type;
-	unsigned long ul;
 	void *blob_data = odb_read_object(the_repository->objects, &ce->oid,
-					  &type, &ul);
+					  &type, size);
 
-	*size = ul;
 	if (blob_data) {
 		if (type == OBJ_BLOB)
 			return blob_data;
@@ -321,7 +332,8 @@ static int write_entry(struct cache_entry *ce, char *path, struct conv_attrs *ca
 		 * We can't make a real symlink; write out a regular file entry
 		 * with the symlink destination as its contents.
 		 */
-		if (!has_symlinks || to_tempfile)
+		if (!repo_has_symlinks(state->istate && state->istate->repo ?
+				       state->istate->repo : the_repository) || to_tempfile)
 			goto write_file_entry;
 
 		ret = create_symlink(state->istate, new_blob, path);
@@ -446,7 +458,8 @@ static int check_path(const char *path, int len, struct stat *st, int skiplen)
 static void mark_colliding_entries(const struct checkout *state,
 				   struct cache_entry *ce, struct stat *st)
 {
-	int trust_ino = check_stat;
+	struct repo_config_values *cfg = repo_config_values(the_repository);
+	int trust_ino = cfg->check_stat;
 
 #if defined(GIT_WINDOWS_NATIVE) || defined(__CYGWIN__)
 	trust_ino = 0;

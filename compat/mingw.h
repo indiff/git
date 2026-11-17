@@ -57,6 +57,7 @@ char *mingw_strbuf_realpath(struct strbuf *resolved, const char *path);
  */
 int is_path_owned_by_current_sid(const char *path, struct strbuf *report);
 #define is_path_owned_by_current_user is_path_owned_by_current_sid
+int is_valid_windows_path_element(wchar_t ch);
 
 /**
  * Verifies that the given path is a valid one on Windows.
@@ -282,6 +283,9 @@ void open_in_gdb(void);
  * Used by Pthread API implementation for Windows
  */
 int err_win_to_posix(DWORD winerr);
+
+int mingw_platform_has_symlinks(void);
+#define platform_has_symlinks() mingw_platform_has_symlinks()
 
 #ifndef NO_UNIX_SOCKETS
 int mingw_have_unix_sockets(void);

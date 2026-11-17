@@ -21,12 +21,10 @@
 #include "statinfo.h"
 #include "trace.h"
 
-void set_alternate_shallow_file(struct repository *r, const char *path, int override)
+void set_alternate_shallow_file(struct repository *r, const char *path)
 {
 	if (r->parsed_objects->is_shallow != -1)
 		BUG("is_repository_shallow must not be called before set_alternate_shallow_file");
-	if (r->parsed_objects->alternate_shallow_file && !override)
-		return;
 	free(r->parsed_objects->alternate_shallow_file);
 	r->parsed_objects->alternate_shallow_file = xstrdup_or_null(path);
 }
@@ -40,7 +38,7 @@ int register_shallow(struct repository *r, const struct object_id *oid)
 	oidcpy(&graft->oid, oid);
 	graft->nr_parent = -1;
 	if (commit && commit->object.parsed) {
-		free_commit_list(commit->parents);
+		commit_list_free(commit->parents);
 		commit->parents = NULL;
 	}
 	return register_commit_graft(r, graft, 0);
@@ -130,11 +128,24 @@ static void free_depth_in_slab(int **ptr)
 {
 	FREE_AND_NULL(*ptr);
 }
-struct commit_list *get_shallow_commits(struct object_array *heads, int depth,
-		int shallow_flag, int not_shallow_flag)
+/*
+ * This is a common internal function that can either return a list of
+ * shallow commits or calculate the current maximum depth of a shallow
+ * repository, depending on the input parameters.
+ *
+ * Depth calculation is triggered by passing the `shallows` parameter.
+ * In this case, the computed depth is stored in `max_cur_depth` (if it is
+ * provided), and the function returns NULL.
+ *
+ * Otherwise, `max_cur_depth` remains unchanged and the function returns
+ * a list of shallow commits.
+ */
+static struct commit_list *get_shallows_or_depth(struct object_array *heads,
+				struct object_array *shallows, int *max_cur_depth,
+				int depth, int shallow_flag, int not_shallow_flag)
 {
 	size_t i = 0;
-	int cur_depth = 0;
+	int cur_depth = 0, cur_depth_shallow = 0;
 	struct commit_list *result = NULL;
 	struct object_array stack = OBJECT_ARRAY_INIT;
 	struct commit *commit = NULL;
@@ -168,16 +179,30 @@ struct commit_list *get_shallow_commits(struct object_array *heads, int depth,
 		}
 		parse_commit_or_die(commit);
 		cur_depth++;
-		if ((depth != INFINITE_DEPTH && cur_depth >= depth) ||
-		    (is_repository_shallow(the_repository) && !commit->parents &&
-		     (graft = lookup_commit_graft(the_repository, &commit->object.oid)) != NULL &&
-		     graft->nr_parent < 0)) {
-			commit_list_insert(commit, &result);
-			commit->object.flags |= shallow_flag;
-			commit = NULL;
-			continue;
+		if (shallows) {
+			for (size_t j = 0; j < shallows->nr; j++)
+				if (oideq(&commit->object.oid, &shallows->objects[j].item->oid))
+					if (!cur_depth_shallow || cur_depth < cur_depth_shallow)
+						cur_depth_shallow = cur_depth;
+
+			if ((is_repository_shallow(the_repository) && !commit->parents &&
+			     (graft = lookup_commit_graft(the_repository, &commit->object.oid)) != NULL &&
+			     graft->nr_parent < 0)) {
+				commit = NULL;
+				continue;
+			}
+		} else {
+			if ((depth != INFINITE_DEPTH && cur_depth >= depth) ||
+			    (is_repository_shallow(the_repository) && !commit->parents &&
+			     (graft = lookup_commit_graft(the_repository, &commit->object.oid)) != NULL &&
+			     graft->nr_parent < 0)) {
+				commit_list_insert(commit, &result);
+				commit->object.flags |= shallow_flag;
+				commit = NULL;
+				continue;
+			}
+			commit->object.flags |= not_shallow_flag;
 		}
-		commit->object.flags |= not_shallow_flag;
 		for (p = commit->parents, commit = NULL; p; p = p->next) {
 			int **depth_slot = commit_depth_at(&depths, p->item);
 			if (!*depth_slot) {
@@ -198,8 +223,34 @@ struct commit_list *get_shallow_commits(struct object_array *heads, int depth,
 		}
 	}
 	deep_clear_commit_depth(&depths, free_depth_in_slab);
+	object_array_clear(&stack);
 
+	if (shallows && max_cur_depth)
+		*max_cur_depth = cur_depth_shallow;
 	return result;
+}
+
+int get_shallows_depth(struct object_array *heads, struct object_array *shallows)
+{
+	int max_cur_depth = 0;
+	get_shallows_or_depth(heads, shallows, &max_cur_depth, 0, 0, 0);
+	return max_cur_depth;
+
+}
+
+struct commit_list *get_shallow_commits(struct object_array *heads,
+					struct object_array *shallows, int deepen_relative,
+					int depth, int shallow_flag, int not_shallow_flag)
+{
+	if (shallows && deepen_relative) {
+		int cur_shallow_depth = get_shallows_depth(heads, shallows);
+		if (cur_shallow_depth)
+			depth += cur_shallow_depth;
+		else
+			return NULL;
+	}
+	return get_shallows_or_depth(heads, NULL, NULL,
+				     depth, shallow_flag, not_shallow_flag);
 }
 
 static void show_commit(struct commit *commit, void *data)
@@ -267,7 +318,7 @@ struct commit_list *get_shallow_commits_by_rev_list(struct strvec *argv,
 				break;
 			}
 	}
-	free_commit_list(not_shallow_list);
+	commit_list_free(not_shallow_list);
 
 	/*
 	 * Now we can clean up NOT_SHALLOW on border commits. Having
@@ -306,19 +357,20 @@ struct write_shallow_data {
 static int write_one_shallow(const struct commit_graft *graft, void *cb_data)
 {
 	struct write_shallow_data *data = cb_data;
-	const char *hex = oid_to_hex(&graft->oid);
+	char hex[GIT_MAX_HEXSZ + 1];
+
+	oid_to_hex_r(hex, &graft->oid);
 	if (graft->nr_parent != -1)
 		return 0;
 	if (data->flags & QUICK) {
 		if (!odb_has_object(the_repository->objects, &graft->oid,
-				    HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR))
+				    ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 			return 0;
 	} else if (data->flags & SEEN_ONLY) {
 		struct commit *c = lookup_commit(the_repository, &graft->oid);
 		if (!c || !(c->object.flags & SEEN)) {
 			if (data->flags & VERBOSE)
-				printf("Removing %s from .git/shallow\n",
-				       oid_to_hex(&c->object.oid));
+				printf("Removing %s from .git/shallow\n", hex);
 			return 0;
 		}
 	}
@@ -346,7 +398,7 @@ static int write_shallow_commits_1(struct strbuf *out, int use_pack_protocol,
 	if (!extra)
 		return data.count;
 	for (size_t i = 0; i < extra->nr; i++) {
-		strbuf_addstr(out, oid_to_hex(extra->oid + i));
+		strbuf_add_oid_hex(out, extra->oid + i);
 		strbuf_addch(out, '\n');
 		data.count++;
 	}
@@ -479,7 +531,7 @@ void prepare_shallow_info(struct shallow_info *info, struct oid_array *sa)
 	ALLOC_ARRAY(info->theirs, sa->nr);
 	for (size_t i = 0; i < sa->nr; i++) {
 		if (odb_has_object(the_repository->objects, sa->oid + i,
-				   HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR)) {
+				   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR)) {
 			struct commit_graft *graft;
 			graft = lookup_commit_graft(the_repository,
 						    &sa->oid[i]);
@@ -518,7 +570,7 @@ void remove_nonexistent_theirs_shallow(struct shallow_info *info)
 		if (i != dst)
 			info->theirs[dst] = info->theirs[i];
 		if (odb_has_object(the_repository->objects, oid + info->theirs[i],
-				   HAS_OBJECT_RECHECK_PACKED | HAS_OBJECT_FETCH_PROMISOR))
+				   ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR))
 			dst++;
 	}
 	info->nr_theirs = dst;

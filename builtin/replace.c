@@ -127,7 +127,7 @@ static int for_each_replace_name(const char **argv, each_replace_name_fn fn)
 		}
 
 		strbuf_setlen(&ref, base_len);
-		strbuf_addstr(&ref, oid_to_hex(&oid));
+		strbuf_add_oid_hex(&ref, &oid);
 		full_hex = ref.buf + base_len;
 
 		if (refs_read_ref(get_main_ref_store(the_repository), ref.buf, &oid)) {
@@ -459,7 +459,7 @@ static int create_graft(int argc, const char **argv, int force, int gentle)
 	struct commit *commit;
 	struct strbuf buf = STRBUF_INIT;
 	const char *buffer;
-	unsigned long size;
+	size_t size;
 
 	if (repo_get_oid(the_repository, old_ref, &old_oid) < 0)
 		return error(_("not a valid object name: '%s'"), old_ref);

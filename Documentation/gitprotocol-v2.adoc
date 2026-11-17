@@ -558,31 +558,46 @@ object-info
 
 `object-info` is the command to retrieve information about one or more objects.
 Its main purpose is to allow a client to make decisions based on this
-information without having to fully fetch objects. Object size is the only
-information that is currently supported.
+information without having to fully fetch objects. Currently only object size
+and type are supported.
 
 An `object-info` request takes the following arguments:
 
 	size
 	Requests size information to be returned for each listed object id.
 
+	type
+	Requests type information to be returned for each listed object id.
+
 	oid <oid>
 	Indicates to the server an object which the client wants to obtain
-	information for.
+	information for. They must be full OIDs.
 
-The response of `object-info` is a list of the requested object ids
-and associated requested information, each separated by a single space.
+The response of `object-info` consists of one pkt-line per requested attribute,
+echoing the attributes the server will report, followed by one pkt-line per
+requested object id with its information, each field separated by a single
+space.
 
 	output = info flush-pkt
 
-	info = PKT-LINE(attrs) LF)
-		*PKT-LINE(obj-info LF)
+	info = *PKT-LINE(attr LF)
+	       *PKT-LINE(obj-info LF)
 
-	attrs = attr | attrs SP attrs
+	attr = "size" | "type"
 
-	attr = "size"
+	obj-size = 1*DIGIT
 
-	obj-info = obj-id SP obj-size
+	obj-type = "blob" | "tree" | "commit" | "tag"
+
+	obj-val = obj-size | obj-type
+
+	obj-info = obj-id [SP [obj-val *(SP obj-val)]]
+
+The values in `obj-info` appear in the same order as the corresponding `attr`
+lines, with exactly one value per requested attribute.
+
+If the server does not recognize the OID, the response will be `<oid> SP`
+regardless of the number of attributes requested.
 
 bundle-uri
 ~~~~~~~~~~
@@ -659,7 +674,7 @@ use by the client, MUST indicate prerequisites (in any) with standard
 applicable.
 +
 The advertised URI may alternatively contain a plaintext file that `git
-config --list` would accept (with the `--file` option). The key-value
+config list` would accept (with the `--file` option). The key-value
 pairs in this list are in the `bundle.*` namespace (see
 linkgit:git-config[1]).
 
@@ -812,10 +827,15 @@ MUST appear first in each pr-fields, in that order.
 After these mandatory fields, the server MAY advertise the following
 optional fields in any order:
 
-`partialCloneFilter`:: The filter specification used by the remote.
+`partialCloneFilter`:: The filter specification for the remote. It
+corresponds to the "remote.<name>.partialCloneFilter" config setting.
 Clients can use this to determine if the remote's filtering strategy
-is compatible with their needs (e.g., checking if both use "blob:none").
-It corresponds to the "remote.<name>.partialCloneFilter" config setting.
+is compatible with their needs (e.g., checking if both use
+"blob:none"). Additionally they can use this through the
+`--filter=auto` option in linkgit:git-clone[1]. With that option, the
+filter specification of the clone will be automatically computed by
+combining the filter specifications of the promisor remotes the client
+accepts.
 
 `token`:: An authentication token that clients can use when
 connecting to the remote. It corresponds to the "remote.<name>.token"
@@ -826,9 +846,11 @@ are case-sensitive and MUST be transmitted exactly as specified
 above. Clients MUST ignore fields they don't recognize to allow for
 future protocol extensions.
 
-For now, the client can only use information transmitted through these
-fields to decide if it accepts the advertised promisor remote. In the
-future that information might be used for other purposes though.
+The client can use information transmitted through these fields to
+decide if it accepts the advertised promisor remote. Also, the client
+can be configured to store the values of these fields or use them
+to automatically configure the repository (see "promisor.storeFields"
+in linkgit:git-config[1] and `--filter=auto` in linkgit:git-clone[1]).
 
 Field values MUST be urlencoded.
 
@@ -840,6 +862,10 @@ advertised, it can reply with "promisor-remote=<pr-names>" where
 
 where `pr-name` is the urlencoded name of a promisor remote the server
 advertised and the client accepts.
+
+The promisor remotes that the client accepted will be tried before the
+other configured promisor remotes when the client attempts to fetch
+missing objects.
 
 Note that, everywhere in this document, the ';' and ',' characters
 MUST be encoded if they appear in `pr-name` or `field-value`.
@@ -855,9 +881,11 @@ the server advertised, the client shouldn't advertise the
 
 On the server side, the "promisor.advertise" and "promisor.sendFields"
 configuration options can be used to control what it advertises. On
-the client side, the "promisor.acceptFromServer" configuration option
-can be used to control what it accepts. See the documentation of these
-configuration options for more information.
+the client side, the "promisor.acceptFromServer" and
+"promisor.acceptFromServerUrl" configuration options can be used to
+control what it accepts, and the "promisor.storeFields" option, to
+control what it stores. See the documentation of these configuration
+options in linkgit:git-config[1] for more information.
 
 Note that in the future it would be nice if the "promisor-remote"
 protocol capability could be used by the server, when responding to

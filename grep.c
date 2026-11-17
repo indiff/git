@@ -864,9 +864,9 @@ void free_grep_patterns(struct grep_opt *opt)
 		free_pattern_expr(opt->pattern_expression);
 }
 
-static const char *end_of_line(const char *cp, unsigned long *left)
+static const char *end_of_line(const char *cp, size_t *left)
 {
-	unsigned long l = *left;
+	size_t l = *left;
 	while (l && *cp != '\n') {
 		l--;
 		cp++;
@@ -1267,6 +1267,7 @@ static void show_line(struct grep_opt *opt,
 		regmatch_t match;
 		enum grep_context ctx = GREP_CONTEXT_BODY;
 		int eflags = 0;
+		const char *start = bol;
 
 		if (want_color(opt->color)) {
 			if (sign == ':')
@@ -1285,6 +1286,7 @@ static void show_line(struct grep_opt *opt,
 			if (match.rm_so == match.rm_eo)
 				break;
 
+			cno = bol - start + match.rm_so + 1;
 			if (opt->only_matching)
 				show_line_header(opt, name, lno, cno, sign);
 			else
@@ -1294,7 +1296,6 @@ static void show_line(struct grep_opt *opt,
 			if (opt->only_matching)
 				opt->output(opt, "\n", 1);
 			bol += match.rm_eo;
-			cno += match.rm_eo;
 			rest -= match.rm_eo;
 			eflags = REG_NOTBOL;
 		}
@@ -1453,7 +1454,7 @@ static int should_lookahead(struct grep_opt *opt)
 }
 
 static int look_ahead(struct grep_opt *opt,
-		      unsigned long *left_p,
+		      size_t *left_p,
 		      unsigned *lno_p,
 		      const char **bol_p)
 {
@@ -1566,7 +1567,7 @@ static int grep_source_1(struct grep_opt *opt, struct grep_source *gs, int colle
 {
 	const char *bol;
 	const char *peek_bol = NULL;
-	unsigned long left;
+	size_t left;
 	unsigned lno = 1;
 	unsigned last_hit = 0;
 	int binary_match_only = 0;
@@ -1736,7 +1737,7 @@ static int grep_source_1(struct grep_opt *opt, struct grep_source *gs, int colle
 			goto next_line;
 		}
 		if (show_function && (!peek_bol || peek_bol < bol)) {
-			unsigned long peek_left = left;
+			size_t peek_left = left;
 			const char *peek_eol = eol;
 
 			/*
@@ -1855,7 +1856,7 @@ int grep_source(struct grep_opt *opt, struct grep_source *gs)
 
 static void grep_source_init_buf(struct grep_source *gs,
 				 const char *buf,
-				 unsigned long size)
+				 size_t size)
 {
 	gs->type = GREP_SOURCE_BUF;
 	gs->name = NULL;
@@ -1866,7 +1867,7 @@ static void grep_source_init_buf(struct grep_source *gs,
 	gs->identifier = NULL;
 }
 
-int grep_buffer(struct grep_opt *opt, const char *buf, unsigned long size)
+int grep_buffer(struct grep_opt *opt, const char *buf, size_t size)
 {
 	struct grep_source gs;
 	int r;

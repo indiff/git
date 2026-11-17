@@ -64,9 +64,10 @@ void object_array_init(struct object_array *array);
 
 /*
  * object flag allocation:
- * revision.h:               0---------10         15               23------27
+ * revision.h:               0---------10         15               23--------28
  * fetch-pack.c:             01    67
  * negotiator/default.c:       2--5
+ * negotiator/skipping.c:      2--5
  * walker.c:                 0-2
  * upload-pack.c:                4       11-----14  16-----19
  * builtin/blame.c:                        12-13
@@ -74,19 +75,19 @@ void object_array_init(struct object_array *array);
  * bundle.c:                                        16
  * http-push.c:                          11-----14
  * commit-graph.c:                                15
- * commit-reach.c:                                  16-----19
+ * commit-reach.c:                                  16-------20
  * builtin/last-modified.c:                         1617
- * sha1-name.c:                                              20
+ * object-name.c:                                            20
  * list-objects-filter.c:                                      21
  * bloom.c:                                                    2122
  * builtin/fsck.c:           0--3
  * builtin/index-pack.c:                                     2021
  * reflog.c:                           10--12
- * builtin/show-branch.c:    0-------------------------------------------26
+ * builtin/show-branch.c:    0-----------------------------------------------28
  * builtin/unpack-objects.c:                                 2021
  * pack-bitmap.h:                                              2122
  */
-#define FLAG_BITS  28
+#define FLAG_BITS  29
 
 #define TYPE_BITS 3
 
@@ -309,6 +310,11 @@ enum peel_status peel_object(struct repository *r,
 			     const struct object_id *name,
 			     struct object_id *oid,
 			     unsigned flags);
+enum peel_status peel_object_ext(struct repository *r,
+				 const struct object_id *name,
+				 struct object_id *oid,
+				 unsigned flags,
+				 enum object_type *typep);
 
 struct object_list *object_list_insert(struct object *item,
 				       struct object_list **list_p);

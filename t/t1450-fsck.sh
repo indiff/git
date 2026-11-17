@@ -68,7 +68,7 @@ test_expect_success 'object with hash mismatch' '
 		git update-ref refs/heads/bogus $cmt &&
 
 		test_must_fail git fsck 2>out &&
-		grep "$oldoid: hash-path mismatch, found at: .*$new" out
+		test_grep "$oldoid: hash-path mismatch, found at: .*$new" out
 	)
 '
 
@@ -172,7 +172,7 @@ test_expect_success 'commit with multiple signatures is okay' '
 	test_when_finished "git update-ref -d refs/heads/bogus" &&
 	git fsck 2>out &&
 	cat out &&
-	! grep "commit $new" out
+	test_grep ! "commit $new" out
 '
 
 test_expect_success 'email without @ is okay' '
@@ -183,7 +183,7 @@ test_expect_success 'email without @ is okay' '
 	git update-ref refs/heads/bogus "$new" &&
 	test_when_finished "git update-ref -d refs/heads/bogus" &&
 	git fsck 2>out &&
-	! grep "commit $new" out
+	test_grep ! "commit $new" out
 '
 
 test_expect_success 'email with embedded > is not okay' '
@@ -538,6 +538,23 @@ test_expect_success 'rev-list --verify-objects with bad sha1' '
 	test_grep -q "error: hash mismatch $(dirname $new)$(test_oid ff_2)" out
 '
 
+test_expect_success 'rev-list --verify-objects with truncated loose blob' '
+	git init truncated-blob &&
+	(
+		cd truncated-blob &&
+		blob=$(test-tool genrandom one 5k | git hash-object -t blob -w --stdin) &&
+		obj=.git/objects/$(test_oid_to_path $blob) &&
+
+		# Truncate the loose blob such that its header can still be
+		# parsed, but reading the object data fails mid-stream.
+		test_copy_bytes 64 <"$obj" >obj.tmp &&
+		mv obj.tmp "$obj" &&
+
+		test_must_fail git rev-list --verify-objects "$blob" 2>err &&
+		test_grep "hash mismatch" err
+	)
+'
+
 # An actual bit corruption is more likely than swapped commits, but
 # this provides an easy way to have commits which don't match their purported
 # hashes, but which aren't so broken we can't read them at all.
@@ -626,7 +643,7 @@ test_expect_success 'fsck notices excessively large tree entry name' '
 		cd large-name &&
 		test_commit a-long-name &&
 		git -c fsck.largePathname=warn:10 fsck 2>out &&
-		grep "warning.*large pathname" out
+		test_grep "warning.*large pathname" out
 	)
 '
 
@@ -827,6 +844,11 @@ test_expect_success 'alternate objects are correctly blamed' '
 	echo "../../alt.git/objects" >.git/objects/info/alternates &&
 	mkdir alt.git/objects/$(dirname $path) &&
 	>alt.git/objects/$(dirname $path)/$(basename $path) &&
+
+	# Without "--full", only the local object source is checked.
+	git fsck --no-full >out 2>&1 &&
+	test_must_be_empty out &&
+
 	test_must_fail git fsck >out 2>&1 &&
 	test_grep alt.git out
 '
@@ -849,7 +871,45 @@ test_expect_success 'fsck errors in packed objects' '
 	test_must_fail git fsck 2>out &&
 	test_grep "error in commit $one.* - bad name" out &&
 	test_grep "error in commit $two.* - bad name" out &&
-	! grep corrupt out
+	test_grep ! corrupt out
+'
+
+test_expect_success 'fsck handles multiple packfiles with big blobs' '
+	test_when_finished "rm -rf repo" &&
+	git init repo &&
+	(
+		cd repo &&
+
+		# We construct two packfiles with two objects in common and one
+		# object not in common. The objects in common can then be
+		# corrupted in one of the packfiles, respectively. The other
+		# objects that are unique to the packs are merely used to not
+		# have both packs contain the same data.
+		blob_one=$(test-tool genrandom one 200k | git hash-object -t blob -w --stdin) &&
+		blob_two=$(test-tool genrandom two 200k | git hash-object -t blob -w --stdin) &&
+		blob_three=$(test-tool genrandom three 200k | git hash-object -t blob -w --stdin) &&
+		blob_four=$(test-tool genrandom four 200k | git hash-object -t blob -w --stdin) &&
+		pack_one=$(printf "%s\n" "$blob_one" "$blob_two" "$blob_three" | git pack-objects .git/objects/pack/pack) &&
+		pack_two=$(printf "%s\n" "$blob_two" "$blob_three" "$blob_four" | git pack-objects .git/objects/pack/pack) &&
+		chmod a+w .git/objects/pack/pack-*.pack &&
+
+		# Corrupt blob two in the first pack.
+		git verify-pack -v .git/objects/pack/pack-$pack_one >objects &&
+		offset_one=$(sed <objects -n "s/^$blob_two .* \(.*\)$/\1/p") &&
+		printf "\0" | dd of=.git/objects/pack/pack-$pack_one.pack bs=1 conv=notrunc seek=$offset_one &&
+
+		# Corrupt blob three in the second pack.
+		git verify-pack -v .git/objects/pack/pack-$pack_two >objects &&
+		offset_two=$(sed <objects -n "s/^$blob_three .* \(.*\)$/\1/p") &&
+		printf "\0" | dd of=.git/objects/pack/pack-$pack_two.pack bs=1 conv=notrunc seek=$offset_two &&
+
+		# We now expect to see two failures for the corrupted objects,
+		# even though they exist in a non-corrupted form in the
+		# respective other pack.
+		test_must_fail git -c core.bigFileThreshold=100k fsck 2>err &&
+		test_grep "unknown object type 0 at offset $offset_one in .git/objects/pack/pack-$pack_one.pack" err &&
+		test_grep "unknown object type 0 at offset $offset_two in .git/objects/pack/pack-$pack_two.pack" err
+	)
 '
 
 test_expect_success 'fsck fails on corrupt packfile' '
@@ -918,7 +978,7 @@ test_expect_success 'fsck detects trailing loose garbage (large blob)' '
 test_expect_success 'fsck detects truncated loose object' '
 	# make it big enough that we know we will truncate in the data
 	# portion, not the header
-	test-tool genrandom truncate 4096 >file &&
+	test-tool genrandom truncate 4k >file &&
 	blob=$(git hash-object -w file) &&
 	file=$(sha1_file $blob) &&
 	test_when_finished "remove_object $blob" &&
@@ -989,7 +1049,7 @@ test_expect_success 'bogus head does not fallback to all heads' '
 	test_when_finished "git rm --cached foo" &&
 	remove_object $blob &&
 	test_must_fail git fsck $ZERO_OID >out 2>&1 &&
-	! grep $blob out
+	test_grep ! $blob out
 '
 
 # Corrupt the checksum on the index.

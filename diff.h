@@ -294,9 +294,9 @@ struct diff_options {
 	enum git_colorbool use_color;
 
 	/* Number of context lines to generate in patch output. */
-	int context;
+	unsigned int context;
 
-	int interhunkcontext;
+	unsigned int interhunkcontext;
 
 	/* Affects the way detection logic for complete rewrites, renames and
 	 * copies.
@@ -757,7 +757,7 @@ int textconv_object(struct repository *repo,
 		    const char *path,
 		    unsigned mode,
 		    const struct object_id *oid, int oid_valid,
-		    char **buf, unsigned long *buf_size);
+		    char **buf, size_t *buf_size);
 
 int parse_rename_score(const char **cp_p);
 

@@ -506,7 +506,7 @@ static void finish(struct commit *head_commit,
 			 * We ignore errors in 'gc --auto', since the
 			 * user should see them.
 			 */
-			run_auto_maintenance(verbosity < 0);
+			run_auto_maintenance(the_repository, verbosity < 0);
 		}
 	}
 	if (new_head && show_diffstat) {
@@ -537,7 +537,8 @@ static void finish(struct commit *head_commit,
 	run_hooks_l(the_repository, "post-merge", squash ? "1" : "0", NULL);
 
 	if (new_head)
-		apply_autostash_ref(the_repository, "MERGE_AUTOSTASH");
+		apply_autostash_ref(the_repository, "MERGE_AUTOSTASH",
+				    NULL, NULL, NULL, NULL);
 	strbuf_release(&reflog_message);
 }
 
@@ -552,7 +553,7 @@ static void merge_name(const char *remote, struct strbuf *msg)
 	char *found_ref = NULL;
 	int len, early;
 
-	copy_branchname(&bname, remote, 0);
+	copy_branchname(the_repository, &bname, remote, 0);
 	remote = bname.buf;
 
 	oidclr(&branch_head, the_repository->hash_algo);
@@ -831,7 +832,7 @@ static int try_merge_strategy(const char *strategy, struct commit_list *common,
 				       LOCK_DIE_ON_ERROR);
 		clean = merge_ort_recursive(&o, head, remoteheads->item,
 					    reversed, &result);
-		free_commit_list(reversed);
+		commit_list_free(reversed);
 		strbuf_release(&o.obuf);
 
 		if (clean < 0) {
@@ -1006,7 +1007,7 @@ static int merge_trivial(struct commit *head, struct commit_list *remoteheads)
 	finish(head, remoteheads, &result_commit, "In-index merge");
 
 	remove_merge_branch_state(the_repository);
-	free_commit_list(parents);
+	commit_list_free(parents);
 	return 0;
 }
 
@@ -1022,7 +1023,7 @@ static int finish_automerge(struct commit *head,
 	struct object_id result_commit;
 
 	write_tree_trivial(result_tree);
-	free_commit_list(common);
+	commit_list_free(common);
 	parents = remoteheads;
 	if (!head_subsumed || fast_forward == FF_NO)
 		commit_list_insert(head, &parents);
@@ -1035,7 +1036,7 @@ static int finish_automerge(struct commit *head,
 
 	strbuf_release(&buf);
 	remove_merge_branch_state(the_repository);
-	free_commit_list(parents);
+	commit_list_free(parents);
 	return 0;
 }
 
@@ -1197,7 +1198,7 @@ static struct commit_list *reduce_parents(struct commit *head_commit,
 
 	/* Find what parents to record by checking independent ones. */
 	parents = reduce_heads(remoteheads);
-	free_commit_list(remoteheads);
+	commit_list_free(remoteheads);
 
 	remoteheads = NULL;
 	remotes = &remoteheads;
@@ -1372,7 +1373,7 @@ int cmd_merge(int argc,
 	struct commit_list *common = NULL;
 	const char *best_strategy = NULL, *wt_strategy = NULL;
 	struct commit_list *remoteheads = NULL, *p;
-	void *branch_to_free;
+	void *branch_to_free, *argv_to_free = NULL;
 	int orig_argc = argc;
 	int merge_log_config = -1;
 
@@ -1516,8 +1517,10 @@ int cmd_merge(int argc,
 		option_commit = 1;
 
 	if (!argc) {
-		if (default_to_upstream)
+		if (default_to_upstream) {
 			argc = setup_with_upstream(&argv);
+			argv_to_free = argv;
+		}
 		else
 			die(_("No commit specified and merge.defaultToUpstream not set."));
 	} else if (argc == 1 && !strcmp(argv[0], "-")) {
@@ -1672,12 +1675,14 @@ int cmd_merge(int argc,
 		}
 
 		if (autostash)
-			create_autostash_ref(the_repository, "MERGE_AUTOSTASH");
+			create_autostash_ref(the_repository, "MERGE_AUTOSTASH",
+					     NULL, false);
 		if (checkout_fast_forward(the_repository,
 					  &head_commit->object.oid,
 					  &commit->object.oid,
 					  overwrite_ignore)) {
-			apply_autostash_ref(the_repository, "MERGE_AUTOSTASH");
+			apply_autostash_ref(the_repository, "MERGE_AUTOSTASH",
+					    NULL, NULL, NULL, NULL);
 			ret = 1;
 			goto done;
 		}
@@ -1735,21 +1740,11 @@ int cmd_merge(int argc,
 		struct commit_list *j;
 
 		for (j = remoteheads; j; j = j->next) {
-			struct commit_list *common_one = NULL;
-			struct commit *common_item;
-
-			/*
-			 * Here we *have* to calculate the individual
-			 * merge_bases again, otherwise "git merge HEAD^
-			 * HEAD^^" would be missed.
-			 */
-			if (repo_get_merge_bases(the_repository, head_commit,
-						 j->item, &common_one) < 0)
+			int ret = repo_in_merge_bases(the_repository,
+						      j->item, head_commit);
+			if (ret < 0)
 				exit(128);
-
-			common_item = common_one->item;
-			free_commit_list(common_one);
-			if (!oideq(&common_item->object.oid, &j->item->object.oid)) {
+			if (!ret) {
 				up_to_date = 0;
 				break;
 			}
@@ -1764,7 +1759,8 @@ int cmd_merge(int argc,
 		die_ff_impossible();
 
 	if (autostash)
-		create_autostash_ref(the_repository, "MERGE_AUTOSTASH");
+		create_autostash_ref(the_repository, "MERGE_AUTOSTASH",
+				     NULL, false);
 
 	/* We are going to make a new commit. */
 	git_committer_info(IDENT_STRICT);
@@ -1849,7 +1845,8 @@ int cmd_merge(int argc,
 		else
 			fprintf(stderr, _("Merge with strategy %s failed.\n"),
 				use_strategies[0]->name);
-		apply_autostash_ref(the_repository, "MERGE_AUTOSTASH");
+		apply_autostash_ref(the_repository, "MERGE_AUTOSTASH",
+				    NULL, NULL, NULL, NULL);
 		ret = 2;
 		goto done;
 	} else if (best_strategy == wt_strategy)
@@ -1880,11 +1877,12 @@ int cmd_merge(int argc,
 
 done:
 	if (!automerge_was_ok) {
-		free_commit_list(common);
-		free_commit_list(remoteheads);
+		commit_list_free(common);
+		commit_list_free(remoteheads);
 	}
 	strbuf_release(&buf);
 	free(branch_to_free);
+	free(argv_to_free);
 	free(pull_twohead);
 	free(pull_octopus);
 	discard_index(the_repository->index);

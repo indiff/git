@@ -29,7 +29,7 @@ alpine-*)
 	apk add --update shadow sudo meson ninja-build gcc libc-dev curl-dev openssl-dev expat-dev gettext \
 		zlib-ng-dev pcre2-dev python3 musl-libintl perl-utils ncurses \
 		apache2 apache2-http2 apache2-proxy apache2-ssl apache2-webdav apr-util-dbd_sqlite3 \
-		bash cvs gnupg perl-cgi perl-dbd-sqlite perl-io-tty >/dev/null
+		bash cvs gnupg perl-cgi perl-dbd-sqlite perl-io-tty cargo >/dev/null
 	;;
 fedora-*|almalinux-*)
 	case "$jobname" in
@@ -39,17 +39,13 @@ fedora-*|almalinux-*)
 	dnf -yq update >/dev/null &&
 	dnf -yq install shadow-utils sudo make pkg-config gcc findutils diffutils perl python3 gawk gettext zlib-devel expat-devel openssl-devel curl-devel pcre2-devel $MESON_DEPS cargo >/dev/null
 	;;
-ubuntu-*|i386/ubuntu-*|debian-*)
+ubuntu-*|i386/debian-*|debian-*)
 	# Required so that apt doesn't wait for user input on certain packages.
 	export DEBIAN_FRONTEND=noninteractive
 
 	case "$distro" in
 	ubuntu-*)
 		SVN='libsvn-perl subversion'
-		LANGUAGES='language-pack-is'
-		;;
-	i386/ubuntu-*)
-		SVN=
 		LANGUAGES='language-pack-is'
 		;;
 	*)
@@ -74,6 +70,17 @@ ubuntu-*|i386/ubuntu-*|debian-*)
 	if test -f /etc/alternatives/sudo
 	then
 		sudo update-alternatives --set sudo /usr/bin/sudo.ws
+	fi
+
+	# on uutils v0.2.2 from rust-coreutils,
+	#     dirname "foo/."
+	# outputs "." instead of "foo" like it should.
+	# Use GNU coreutils to provide dirname instead.
+	#
+	# See <https://github.com/uutils/coreutils/issues/10508>.
+	if test -x /usr/bin/gnudirname
+	then
+		sudo ln -sfT /usr/bin/gnudirname /usr/bin/dirname
 	fi
 
 	case "$distro" in
@@ -154,10 +161,9 @@ sparse)
 		libexpat-dev gettext zlib1g-dev sparse
 	;;
 Documentation)
-	sudo apt-get -q -y install asciidoc xmlto docbook-xsl-ns make
+	sudo apt-get -q -y install asciidoc xmlto docbook-xsl-ns make ruby \
+		asciidoctor
 
-	test -n "$ALREADY_HAVE_ASCIIDOCTOR" ||
-	sudo gem install --version 1.5.8 asciidoctor
 	sudo gem install concurrent-ruby
 	;;
 esac

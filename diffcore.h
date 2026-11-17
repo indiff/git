@@ -19,6 +19,17 @@ struct userdiff_driver;
  * in anything else.
  */
 
+/* A range [start, end).  Lines are numbered starting at 0. */
+struct range {
+	long start, end;
+};
+
+/* A set of ranges.  The ranges must always be disjoint and sorted. */
+struct range_set {
+	unsigned int alloc, nr;
+	struct range *ranges;
+};
+
 /* We internally use unsigned short as the score value,
  * and rely on an int capable to hold 32-bits.  -B can take
  * -Bmerge_score/break_score format and the two scores are
@@ -43,7 +54,7 @@ struct diff_filespec {
 	char *path;
 	void *data;
 	void *cnt_data;
-	unsigned long size;
+	size_t size;
 	int count;               /* Reference count */
 	int rename_used;         /* Count of rename users */
 	unsigned short mode;	 /* file mode */
@@ -106,6 +117,11 @@ int diff_filespec_is_binary(struct repository *, struct diff_filespec *);
 struct diff_filepair {
 	struct diff_filespec *one;
 	struct diff_filespec *two;
+	/*
+	 * Tracked line ranges for -L filtering; borrowed from
+	 * line_log_data and must not be freed.
+	 */
+	const struct range_set *line_ranges;
 	unsigned short int score;
 	char status; /* M C R A D U etc. (see Documentation/diff-format.adoc or DIFF_STATUS_* in diff.h) */
 	unsigned broken_pair : 1;
